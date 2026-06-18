@@ -40,6 +40,9 @@ static constexpr int LUPINE_RPC_cuStreamGetCaptureInfo_v3 = 1000015;
 static constexpr int LUPINE_RPC_cuDeviceGetGraphMemAttribute = 1000016;
 static constexpr int LUPINE_RPC_cuDeviceSetGraphMemAttribute = 1000017;
 static constexpr int LUPINE_RPC_cuLinkAddData_v2 = 1000018;
+static constexpr int LUPINE_RPC_cuGraphGetEdges = 1000019;
+static constexpr int LUPINE_RPC_cuGraphNodeGetDependencies = 1000020;
+static constexpr int LUPINE_RPC_cuGraphNodeGetDependentNodes = 1000021;
 
 static bool lupine_server_trace_enabled() {
   static int enabled = []() {
@@ -82,10 +85,6 @@ lupine_manual_handlers() {
        {handle_manual_cuPointerGetAttribute, "cuPointerGetAttribute"}},
       {LUPINE_RPC_cuPointerGetAttributes,
        {handle_manual_cuPointerGetAttributes, "cuPointerGetAttributes"}},
-      {RPC_cuArrayCreate_v2,
-       {handle_manual_cuArrayCreate_v2, "cuArrayCreate_v2"}},
-      {RPC_cuArray3DCreate_v2,
-       {handle_manual_cuArray3DCreate_v2, "cuArray3DCreate_v2"}},
       {RPC_cuLinkCreate_v2, {handle_manual_cuLinkCreate_v2, "cuLinkCreate_v2"}},
       {LUPINE_RPC_cuLinkAddData_v2,
        {handle_manual_cuLinkAddData_v2, "cuLinkAddData_v2"}},
@@ -142,7 +141,21 @@ lupine_manual_handlers() {
       {LUPINE_RPC_cuGraphAddNode_v2,
        {handle_manual_cuGraphAddNode, "cuGraphAddNode"}},
       {RPC_cuGraphLaunch, {handle_manual_cuGraphLaunch, "cuGraphLaunch"}},
-      {RPC_cuGraphGetNodes, {handle_manual_cuGraphGetNodes, "cuGraphGetNodes"}},
+      {LUPINE_RPC_cuGraphGetEdges,
+       {handle_manual_cuGraphGetEdges, "cuGraphGetEdges"}},
+      {LUPINE_RPC_cuGraphNodeGetDependencies,
+       {handle_manual_cuGraphNodeGetDependencies,
+        "cuGraphNodeGetDependencies"}},
+      {LUPINE_RPC_cuGraphNodeGetDependentNodes,
+       {handle_manual_cuGraphNodeGetDependentNodes,
+        "cuGraphNodeGetDependentNodes"}},
+      {RPC_cuGraphHostNodeGetParams,
+       {handle_manual_cuGraphHostNodeGetParams, "cuGraphHostNodeGetParams"}},
+      {RPC_cuGraphHostNodeSetParams,
+       {handle_manual_cuGraphHostNodeSetParams, "cuGraphHostNodeSetParams"}},
+      {RPC_cuGraphExecHostNodeSetParams,
+       {handle_manual_cuGraphExecHostNodeSetParams,
+        "cuGraphExecHostNodeSetParams"}},
       {LUPINE_RPC_cuLaunchHostFunc,
        {handle_manual_cuLaunchHostFunc, "cuLaunchHostFunc"}},
       {LUPINE_RPC_cuStreamAddCallback,

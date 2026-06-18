@@ -2903,7 +2903,7 @@ CUresult cuMemsetD2D32Async(CUdeviceptr dstDevice, size_t dstPitch,
                             CUstream hStream);
 /**
  * @param pHandle SEND_RECV
- * @param pAllocateArray SEND_RECV
+ * @param pAllocateArray SEND_ONLY DEREF
  */
 CUresult cuArrayCreate_v2(CUarray *pHandle,
                           const CUDA_ARRAY_DESCRIPTOR *pAllocateArray);
@@ -2955,7 +2955,7 @@ CUresult cuArrayGetPlane(CUarray *pPlaneArray, CUarray hArray,
 CUresult cuArrayDestroy(CUarray hArray);
 /**
  * @param pHandle SEND_RECV
- * @param pAllocateArray SEND_RECV
+ * @param pAllocateArray SEND_ONLY DEREF
  */
 CUresult cuArray3DCreate_v2(CUarray *pHandle,
                             const CUDA_ARRAY3D_DESCRIPTOR *pAllocateArray);
@@ -3588,8 +3588,6 @@ CUresult cuFuncSetSharedMemConfig(CUfunction hfunc, CUsharedconfig config);
  */
 CUresult cuFuncGetModule(CUmodule *hmod, CUfunction hfunc);
 
-// TODO: Spec from here
-
 /**
  * @disabled
  * @param f SEND_ONLY
@@ -3808,12 +3806,14 @@ CUresult cuGraphAddHostNode(CUgraphNode *phGraphNode, CUgraph hGraph,
                             size_t numDependencies,
                             const CUDA_HOST_NODE_PARAMS *nodeParams);
 /**
+ * @disabled - manual host callback trampoline (see cuGraphAddHostNode)
  * @param hNode SEND_ONLY
  * @param nodeParams SEND_RECV
  */
 CUresult cuGraphHostNodeGetParams(CUgraphNode hNode,
                                   CUDA_HOST_NODE_PARAMS *nodeParams);
 /**
+ * @disabled - manual host callback trampoline (see cuGraphAddHostNode)
  * @param hNode SEND_ONLY
  * @param nodeParams SEND_RECV
  */
@@ -3822,8 +3822,8 @@ CUresult cuGraphHostNodeSetParams(CUgraphNode hNode,
 /**
  * @param phGraphNode SEND_RECV
  * @param hGraph SEND_ONLY
- * @param dependencies SEND_RECV
  * @param numDependencies SEND_ONLY
+ * @param dependencies SEND_ONLY LENGTH:numDependencies
  * @param childGraph SEND_ONLY
  */
 CUresult cuGraphAddChildGraphNode(CUgraphNode *phGraphNode, CUgraph hGraph,
@@ -3837,8 +3837,8 @@ CUresult cuGraphChildGraphNodeGetGraph(CUgraphNode hNode, CUgraph *phGraph);
 /**
  * @param phGraphNode SEND_RECV
  * @param hGraph SEND_ONLY
- * @param dependencies SEND_RECV
  * @param numDependencies SEND_ONLY
+ * @param dependencies SEND_ONLY LENGTH:numDependencies
  */
 CUresult cuGraphAddEmptyNode(CUgraphNode *phGraphNode, CUgraph hGraph,
                              const CUgraphNode *dependencies,
@@ -3846,8 +3846,8 @@ CUresult cuGraphAddEmptyNode(CUgraphNode *phGraphNode, CUgraph hGraph,
 /**
  * @param phGraphNode SEND_RECV
  * @param hGraph SEND_ONLY
- * @param dependencies SEND_RECV
  * @param numDependencies SEND_ONLY
+ * @param dependencies SEND_ONLY LENGTH:numDependencies
  * @param event SEND_ONLY
  */
 CUresult cuGraphAddEventRecordNode(CUgraphNode *phGraphNode, CUgraph hGraph,
@@ -3866,8 +3866,8 @@ CUresult cuGraphEventRecordNodeSetEvent(CUgraphNode hNode, CUevent event);
 /**
  * @param phGraphNode SEND_RECV
  * @param hGraph SEND_ONLY
- * @param dependencies SEND_RECV
  * @param numDependencies SEND_ONLY
+ * @param dependencies SEND_ONLY LENGTH:numDependencies
  * @param event SEND_ONLY
  */
 CUresult cuGraphAddEventWaitNode(CUgraphNode *phGraphNode, CUgraph hGraph,
@@ -3886,67 +3886,82 @@ CUresult cuGraphEventWaitNodeSetEvent(CUgraphNode hNode, CUevent event);
 /**
  * @param phGraphNode SEND_RECV
  * @param hGraph SEND_ONLY
- * @param dependencies SEND_RECV
  * @param numDependencies SEND_ONLY
- * @param nodeParams SEND_RECV
+ * @param dependencies SEND_ONLY LENGTH:numDependencies
+ * @param nodeParams SEND_ONLY
+ * @deeparray nodeParams extSemArray numExtSems
+ * @deeparray nodeParams paramsArray numExtSems
  */
 CUresult cuGraphAddExternalSemaphoresSignalNode(
     CUgraphNode *phGraphNode, CUgraph hGraph, const CUgraphNode *dependencies,
     size_t numDependencies, const CUDA_EXT_SEM_SIGNAL_NODE_PARAMS *nodeParams);
 /**
  * @param hNode SEND_ONLY
- * @param params_out SEND_RECV
+ * @param params_out RECV_ONLY
+ * @deeparray params_out extSemArray numExtSems
+ * @deeparray params_out paramsArray numExtSems
  */
 CUresult cuGraphExternalSemaphoresSignalNodeGetParams(
     CUgraphNode hNode, CUDA_EXT_SEM_SIGNAL_NODE_PARAMS *params_out);
 /**
  * @param hNode SEND_ONLY
- * @param nodeParams SEND_RECV
+ * @param nodeParams SEND_ONLY
+ * @deeparray nodeParams extSemArray numExtSems
+ * @deeparray nodeParams paramsArray numExtSems
  */
 CUresult cuGraphExternalSemaphoresSignalNodeSetParams(
     CUgraphNode hNode, const CUDA_EXT_SEM_SIGNAL_NODE_PARAMS *nodeParams);
 /**
  * @param phGraphNode SEND_RECV
  * @param hGraph SEND_ONLY
- * @param dependencies SEND_RECV
  * @param numDependencies SEND_ONLY
- * @param nodeParams SEND_RECV
+ * @param dependencies SEND_ONLY LENGTH:numDependencies
+ * @param nodeParams SEND_ONLY
+ * @deeparray nodeParams extSemArray numExtSems
+ * @deeparray nodeParams paramsArray numExtSems
  */
 CUresult cuGraphAddExternalSemaphoresWaitNode(
     CUgraphNode *phGraphNode, CUgraph hGraph, const CUgraphNode *dependencies,
     size_t numDependencies, const CUDA_EXT_SEM_WAIT_NODE_PARAMS *nodeParams);
 /**
  * @param hNode SEND_ONLY
- * @param params_out SEND_RECV
+ * @param params_out RECV_ONLY
+ * @deeparray params_out extSemArray numExtSems
+ * @deeparray params_out paramsArray numExtSems
  */
 CUresult cuGraphExternalSemaphoresWaitNodeGetParams(
     CUgraphNode hNode, CUDA_EXT_SEM_WAIT_NODE_PARAMS *params_out);
 /**
  * @param hNode SEND_ONLY
- * @param nodeParams SEND_RECV
+ * @param nodeParams SEND_ONLY
+ * @deeparray nodeParams extSemArray numExtSems
+ * @deeparray nodeParams paramsArray numExtSems
  */
 CUresult cuGraphExternalSemaphoresWaitNodeSetParams(
     CUgraphNode hNode, const CUDA_EXT_SEM_WAIT_NODE_PARAMS *nodeParams);
 /**
  * @param phGraphNode SEND_RECV
  * @param hGraph SEND_ONLY
- * @param dependencies SEND_RECV
  * @param numDependencies SEND_ONLY
- * @param nodeParams SEND_RECV
+ * @param dependencies SEND_ONLY LENGTH:numDependencies
+ * @param nodeParams SEND_ONLY
+ * @deeparray nodeParams paramArray count
  */
 CUresult cuGraphAddBatchMemOpNode(
     CUgraphNode *phGraphNode, CUgraph hGraph, const CUgraphNode *dependencies,
     size_t numDependencies, const CUDA_BATCH_MEM_OP_NODE_PARAMS *nodeParams);
 /**
  * @param hNode SEND_ONLY
- * @param nodeParams_out SEND_RECV
+ * @param nodeParams_out RECV_ONLY
+ * @deeparray nodeParams_out paramArray count
  */
 CUresult
 cuGraphBatchMemOpNodeGetParams(CUgraphNode hNode,
                                CUDA_BATCH_MEM_OP_NODE_PARAMS *nodeParams_out);
 /**
  * @param hNode SEND_ONLY
- * @param nodeParams SEND_RECV
+ * @param nodeParams SEND_ONLY
+ * @deeparray nodeParams paramArray count
  */
 CUresult
 cuGraphBatchMemOpNodeSetParams(CUgraphNode hNode,
@@ -3954,7 +3969,8 @@ cuGraphBatchMemOpNodeSetParams(CUgraphNode hNode,
 /**
  * @param hGraphExec SEND_ONLY
  * @param hNode SEND_ONLY
- * @param nodeParams SEND_RECV
+ * @param nodeParams SEND_ONLY
+ * @deeparray nodeParams paramArray count
  */
 CUresult cuGraphExecBatchMemOpNodeSetParams(
     CUgraphExec hGraphExec, CUgraphNode hNode,
@@ -4027,20 +4043,20 @@ CUresult cuGraphNodeFindInClone(CUgraphNode *phNode, CUgraphNode hOriginalNode,
  */
 CUresult cuGraphNodeGetType(CUgraphNode hNode, CUgraphNodeType *type);
 /**
- * @disabled - manual optional node array handling
  * @param hGraph SEND_ONLY
- * @param nodes SEND_RECV
  * @param numNodes SEND_RECV
+ * @param nodes RECV_ONLY LENGTH:numNodes OPTIONAL
  */
 CUresult cuGraphGetNodes(CUgraph hGraph, CUgraphNode *nodes, size_t *numNodes);
 /**
  * @param hGraph SEND_ONLY
- * @param rootNodes SEND_RECV
  * @param numRootNodes SEND_RECV
+ * @param rootNodes RECV_ONLY LENGTH:numRootNodes OPTIONAL
  */
 CUresult cuGraphGetRootNodes(CUgraph hGraph, CUgraphNode *rootNodes,
                              size_t *numRootNodes);
 /**
+ * @disabled - manual optional node array handling; remapped to _v2 by cuda.h
  * @param hGraph SEND_ONLY
  * @param from SEND_RECV
  * @param to SEND_RECV
@@ -4049,6 +4065,7 @@ CUresult cuGraphGetRootNodes(CUgraph hGraph, CUgraphNode *rootNodes,
 CUresult cuGraphGetEdges(CUgraph hGraph, CUgraphNode *from, CUgraphNode *to,
                          size_t *numEdges);
 /**
+ * @disabled - manual optional node array handling; remapped to _v2 by cuda.h
  * @param hNode SEND_ONLY
  * @param dependencies SEND_RECV
  * @param numDependencies SEND_RECV
@@ -4057,6 +4074,7 @@ CUresult cuGraphNodeGetDependencies(CUgraphNode hNode,
                                     CUgraphNode *dependencies,
                                     size_t *numDependencies);
 /**
+ * @disabled - manual optional node array handling; remapped to _v2 by cuda.h
  * @param hNode SEND_ONLY
  * @param dependentNodes SEND_RECV
  * @param numDependentNodes SEND_RECV
@@ -4066,17 +4084,17 @@ CUresult cuGraphNodeGetDependentNodes(CUgraphNode hNode,
                                       size_t *numDependentNodes);
 /**
  * @param hGraph SEND_ONLY
- * @param from SEND_RECV
- * @param to SEND_RECV
  * @param numDependencies SEND_ONLY
+ * @param from SEND_ONLY LENGTH:numDependencies
+ * @param to SEND_ONLY LENGTH:numDependencies
  */
 CUresult cuGraphAddDependencies(CUgraph hGraph, const CUgraphNode *from,
                                 const CUgraphNode *to, size_t numDependencies);
 /**
  * @param hGraph SEND_ONLY
- * @param from SEND_RECV
- * @param to SEND_RECV
  * @param numDependencies SEND_ONLY
+ * @param from SEND_ONLY LENGTH:numDependencies
+ * @param to SEND_ONLY LENGTH:numDependencies
  */
 CUresult cuGraphRemoveDependencies(CUgraph hGraph, const CUgraphNode *from,
                                    const CUgraphNode *to,
@@ -4134,6 +4152,7 @@ cuGraphExecMemsetNodeSetParams(CUgraphExec hGraphExec, CUgraphNode hNode,
                                const CUDA_MEMSET_NODE_PARAMS *memsetParams,
                                CUcontext ctx);
 /**
+ * @disabled - manual host callback trampoline (see cuGraphAddHostNode)
  * @param hGraphExec SEND_ONLY
  * @param hNode SEND_ONLY
  * @param nodeParams SEND_ONLY DEREF
@@ -4165,7 +4184,9 @@ CUresult cuGraphExecEventWaitNodeSetEvent(CUgraphExec hGraphExec,
 /**
  * @param hGraphExec SEND_ONLY
  * @param hNode SEND_ONLY
- * @param nodeParams SEND_ONLY DEREF
+ * @param nodeParams SEND_ONLY
+ * @deeparray nodeParams extSemArray numExtSems
+ * @deeparray nodeParams paramsArray numExtSems
  */
 CUresult cuGraphExecExternalSemaphoresSignalNodeSetParams(
     CUgraphExec hGraphExec, CUgraphNode hNode,
@@ -4173,7 +4194,9 @@ CUresult cuGraphExecExternalSemaphoresSignalNodeSetParams(
 /**
  * @param hGraphExec SEND_ONLY
  * @param hNode SEND_ONLY
- * @param nodeParams SEND_ONLY DEREF
+ * @param nodeParams SEND_ONLY
+ * @deeparray nodeParams extSemArray numExtSems
+ * @deeparray nodeParams paramsArray numExtSems
  */
 CUresult cuGraphExecExternalSemaphoresWaitNodeSetParams(
     CUgraphExec hGraphExec, CUgraphNode hNode,
@@ -4240,7 +4263,7 @@ CUresult cuGraphKernelNodeSetAttribute(CUgraphNode hNode,
                                        const CUkernelNodeAttrValue *value);
 /**
  * @param hGraph SEND_ONLY
- * @param path SEND_RECV
+ * @param path SEND_ONLY NULL_TERMINATED
  * @param flags SEND_ONLY
  */
 CUresult cuGraphDebugDotPrint(CUgraph hGraph, const char *path,
@@ -4680,7 +4703,7 @@ CUresult cuGraphicsResourceSetMapFlags_v2(CUgraphicsResource resource,
                                           unsigned int flags);
 /**
  * @param count SEND_ONLY
- * @param resources SEND_RECV
+ * @param resources SEND_ONLY LENGTH:count
  * @param hStream SEND_ONLY
  */
 CUresult cuGraphicsMapResources(unsigned int count,
@@ -4688,7 +4711,7 @@ CUresult cuGraphicsMapResources(unsigned int count,
                                 CUstream hStream);
 /**
  * @param count SEND_ONLY
- * @param resources SEND_RECV
+ * @param resources SEND_ONLY LENGTH:count
  * @param hStream SEND_ONLY
  */
 CUresult cuGraphicsUnmapResources(unsigned int count,

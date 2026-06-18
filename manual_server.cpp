@@ -7,6 +7,7 @@
 #include <future>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <stdio.h>
 #include <string>
 #include <unordered_map>
@@ -904,50 +905,6 @@ int handle_manual_cuPointerGetAttributes(conn_t *conn) {
   return 0;
 }
 
-int handle_manual_cuArrayCreate_v2(conn_t *conn) {
-  CUDA_ARRAY_DESCRIPTOR desc = {};
-  CUarray handle = nullptr;
-  CUresult result = CUDA_ERROR_INVALID_VALUE;
-
-  if (rpc_read(conn, &desc, sizeof(desc)) < 0) {
-    return -1;
-  }
-  int request_id = rpc_read_end(conn);
-  if (request_id < 0) {
-    return -1;
-  }
-
-  result = cuArrayCreate_v2(&handle, &desc);
-  if (rpc_write_start_response(conn, request_id) < 0 ||
-      rpc_write(conn, &handle, sizeof(handle)) < 0 ||
-      rpc_write(conn, &result, sizeof(result)) < 0 || rpc_write_end(conn) < 0) {
-    return -1;
-  }
-  return 0;
-}
-
-int handle_manual_cuArray3DCreate_v2(conn_t *conn) {
-  CUDA_ARRAY3D_DESCRIPTOR desc = {};
-  CUarray handle = nullptr;
-  CUresult result = CUDA_ERROR_INVALID_VALUE;
-
-  if (rpc_read(conn, &desc, sizeof(desc)) < 0) {
-    return -1;
-  }
-  int request_id = rpc_read_end(conn);
-  if (request_id < 0) {
-    return -1;
-  }
-
-  result = cuArray3DCreate_v2(&handle, &desc);
-  if (rpc_write_start_response(conn, request_id) < 0 ||
-      rpc_write(conn, &handle, sizeof(handle)) < 0 ||
-      rpc_write(conn, &result, sizeof(result)) < 0 || rpc_write_end(conn) < 0) {
-    return -1;
-  }
-  return 0;
-}
-
 struct lupine_jit_server_state {
   std::vector<CUjit_option> options;
   std::vector<uintptr_t> raw_values;
@@ -1474,39 +1431,6 @@ int handle_manual_cuDeviceSetGraphMemAttribute(conn_t *conn) {
 
   result = cuDeviceSetGraphMemAttribute(device, attr, &value);
   if (rpc_write_start_response(conn, request_id) < 0 ||
-      rpc_write(conn, &result, sizeof(result)) < 0 || rpc_write_end(conn) < 0) {
-    return -1;
-  }
-  return 0;
-}
-
-int handle_manual_cuTexObjectCreate(conn_t *conn) {
-  CUDA_RESOURCE_DESC resDesc = {};
-  CUDA_TEXTURE_DESC texDesc = {};
-  CUDA_RESOURCE_VIEW_DESC resViewDesc = {};
-  uint32_t hasTexDesc = 0;
-  uint32_t hasResViewDesc = 0;
-  CUtexObject texObject = 0;
-  CUresult result = CUDA_ERROR_INVALID_VALUE;
-
-  if (rpc_read(conn, &resDesc, sizeof(resDesc)) < 0 ||
-      rpc_read(conn, &hasTexDesc, sizeof(hasTexDesc)) < 0 ||
-      (hasTexDesc != 0 && rpc_read(conn, &texDesc, sizeof(texDesc)) < 0) ||
-      rpc_read(conn, &hasResViewDesc, sizeof(hasResViewDesc)) < 0 ||
-      (hasResViewDesc != 0 &&
-       rpc_read(conn, &resViewDesc, sizeof(resViewDesc)) < 0)) {
-    return -1;
-  }
-  int request_id = rpc_read_end(conn);
-  if (request_id < 0) {
-    return -1;
-  }
-
-  result = cuTexObjectCreate(&texObject, &resDesc,
-                             hasTexDesc != 0 ? &texDesc : nullptr,
-                             hasResViewDesc != 0 ? &resViewDesc : nullptr);
-  if (rpc_write_start_response(conn, request_id) < 0 ||
-      rpc_write(conn, &texObject, sizeof(texObject)) < 0 ||
       rpc_write(conn, &result, sizeof(result)) < 0 || rpc_write_end(conn) < 0) {
     return -1;
   }
@@ -2231,14 +2155,16 @@ int handle_manual_cuGraphAddNode(conn_t *conn) {
   return 0;
 }
 
-int handle_manual_cuGraphGetNodes(conn_t *conn) {
-  CUgraph hGraph = nullptr;
+static int lupine_handle_node_dependency_query(conn_t *conn, bool dependent) {
+  CUgraphNode hNode = nullptr;
   size_t requested = 0;
+  uint8_t want_edge = 0;
   size_t count = 0;
   CUresult result = CUDA_ERROR_INVALID_VALUE;
 
-  if (rpc_read(conn, &hGraph, sizeof(hGraph)) < 0 ||
-      rpc_read(conn, &requested, sizeof(requested)) < 0) {
+  if (rpc_read(conn, &hNode, sizeof(hNode)) < 0 ||
+      rpc_read(conn, &requested, sizeof(requested)) < 0 ||
+      rpc_read(conn, &want_edge, sizeof(want_edge)) < 0) {
     return -1;
   }
   int request_id = rpc_read_end(conn);
@@ -2246,20 +2172,230 @@ int handle_manual_cuGraphGetNodes(conn_t *conn) {
     return -1;
   }
 
+  std::vector<CUgraphNode> nodes;
+#if CUDA_VERSION >= 12030
+  std::vector<CUgraphEdgeData> edges;
+  auto call = [&](CUgraphNode *out, CUgraphEdgeData *edge,
+                  size_t *n) -> CUresult {
+    return dependent ? cuGraphNodeGetDependentNodes_v2(hNode, out, edge, n)
+                     : cuGraphNodeGetDependencies_v2(hNode, out, edge, n);
+  };
   if (requested == 0) {
-    result = cuGraphGetNodes(hGraph, nullptr, &count);
+    result = call(nullptr, nullptr, &count);
   } else {
     count = requested;
+    nodes.resize(count);
+    if (want_edge) {
+      edges.resize(count);
+    }
+    result = call(nodes.data(), want_edge ? edges.data() : nullptr, &count);
   }
-  std::vector<CUgraphNode> nodes(count);
-  if (result == CUDA_SUCCESS && requested != 0) {
-    result = cuGraphGetNodes(hGraph, nodes.data(), &count);
+#else
+  auto call = [&](CUgraphNode *out, size_t *n) -> CUresult {
+    return dependent ? cuGraphNodeGetDependentNodes(hNode, out, n)
+                     : cuGraphNodeGetDependencies(hNode, out, n);
+  };
+  if (requested == 0) {
+    result = call(nullptr, &count);
+  } else {
+    count = requested;
+    nodes.resize(count);
+    result = call(nodes.data(), &count);
   }
+#endif
 
+  bool send_arrays = requested != 0 && count != 0;
   if (rpc_write_start_response(conn, request_id) < 0 ||
       rpc_write(conn, &count, sizeof(count)) < 0 ||
-      (requested != 0 && count != 0 &&
-       rpc_write(conn, nodes.data(), count * sizeof(CUgraphNode)) < 0) ||
+      (send_arrays &&
+       rpc_write(conn, nodes.data(), count * sizeof(CUgraphNode)) < 0)) {
+    return -1;
+  }
+#if CUDA_VERSION >= 12030
+  if (send_arrays && want_edge &&
+      rpc_write(conn, edges.data(), count * sizeof(CUgraphEdgeData)) < 0) {
+    return -1;
+  }
+#endif
+  if (rpc_write(conn, &result, sizeof(result)) < 0 || rpc_write_end(conn) < 0) {
+    return -1;
+  }
+  return 0;
+}
+
+int handle_manual_cuGraphNodeGetDependencies(conn_t *conn) {
+  return lupine_handle_node_dependency_query(conn, /*dependent=*/false);
+}
+
+int handle_manual_cuGraphNodeGetDependentNodes(conn_t *conn) {
+  return lupine_handle_node_dependency_query(conn, /*dependent=*/true);
+}
+
+// cuGraphGetEdges: two parallel out node arrays (from/to) plus an optional
+// CUgraphEdgeData array, all sized by an in/out count.
+int handle_manual_cuGraphGetEdges(conn_t *conn) {
+  CUgraph hGraph = nullptr;
+  size_t requested = 0;
+  uint8_t want_edge = 0;
+  size_t count = 0;
+  CUresult result = CUDA_ERROR_INVALID_VALUE;
+
+  if (rpc_read(conn, &hGraph, sizeof(hGraph)) < 0 ||
+      rpc_read(conn, &requested, sizeof(requested)) < 0 ||
+      rpc_read(conn, &want_edge, sizeof(want_edge)) < 0) {
+    return -1;
+  }
+  int request_id = rpc_read_end(conn);
+  if (request_id < 0) {
+    return -1;
+  }
+
+  std::vector<CUgraphNode> from;
+  std::vector<CUgraphNode> to;
+#if CUDA_VERSION >= 12030
+  std::vector<CUgraphEdgeData> edges;
+  if (requested == 0) {
+    result = cuGraphGetEdges_v2(hGraph, nullptr, nullptr, nullptr, &count);
+  } else {
+    count = requested;
+    from.resize(count);
+    to.resize(count);
+    if (want_edge) {
+      edges.resize(count);
+    }
+    result = cuGraphGetEdges_v2(hGraph, from.data(), to.data(),
+                                want_edge ? edges.data() : nullptr, &count);
+  }
+#else
+  if (requested == 0) {
+    result = cuGraphGetEdges(hGraph, nullptr, nullptr, &count);
+  } else {
+    count = requested;
+    from.resize(count);
+    to.resize(count);
+    result = cuGraphGetEdges(hGraph, from.data(), to.data(), &count);
+  }
+#endif
+
+  bool send_arrays = requested != 0 && count != 0;
+  if (rpc_write_start_response(conn, request_id) < 0 ||
+      rpc_write(conn, &count, sizeof(count)) < 0 ||
+      (send_arrays &&
+       rpc_write(conn, from.data(), count * sizeof(CUgraphNode)) < 0) ||
+      (send_arrays &&
+       rpc_write(conn, to.data(), count * sizeof(CUgraphNode)) < 0)) {
+    return -1;
+  }
+#if CUDA_VERSION >= 12030
+  if (send_arrays && want_edge &&
+      rpc_write(conn, edges.data(), count * sizeof(CUgraphEdgeData)) < 0) {
+    return -1;
+  }
+#endif
+  if (rpc_write(conn, &result, sizeof(result)) < 0 || rpc_write_end(conn) < 0) {
+    return -1;
+  }
+  return 0;
+}
+
+// Host-node callbacks set after node creation must be wrapped in the same
+// trampoline as cuGraphAddHostNode. cuGraphHostNodeSetParams /
+// cuGraphExecHostNodeSetParams give us no graph handle to attach the callback's
+// lifetime to, so keep them alive for the (per-connection) server process.
+static std::vector<lupine_host_callback_data *> &
+lupine_host_setparams_callbacks() {
+  static std::vector<lupine_host_callback_data *> callbacks;
+  return callbacks;
+}
+
+static lupine_host_callback_data *
+lupine_make_host_setparams_callback(conn_t *conn,
+                                    const CUDA_HOST_NODE_PARAMS &params) {
+  static std::mutex mutex;
+  auto *callback =
+      new lupine_host_callback_data{conn, params.fn, params.userData, nullptr};
+  std::lock_guard<std::mutex> guard(mutex);
+  lupine_host_setparams_callbacks().push_back(callback);
+  return callback;
+}
+
+int handle_manual_cuGraphHostNodeSetParams(conn_t *conn) {
+  CUgraphNode hNode = nullptr;
+  CUDA_HOST_NODE_PARAMS params{};
+  CUresult result = CUDA_ERROR_INVALID_VALUE;
+
+  if (rpc_read(conn, &hNode, sizeof(hNode)) < 0 ||
+      rpc_read(conn, &params, sizeof(params)) < 0) {
+    return -1;
+  }
+  int request_id = rpc_read_end(conn);
+  if (request_id < 0) {
+    return -1;
+  }
+
+  auto *callback = lupine_make_host_setparams_callback(conn, params);
+  CUDA_HOST_NODE_PARAMS serverParams{};
+  serverParams.fn = lupine_graph_host_callback;
+  serverParams.userData = callback;
+  result = cuGraphHostNodeSetParams(hNode, &serverParams);
+  if (rpc_write_start_response(conn, request_id) < 0 ||
+      rpc_write(conn, &result, sizeof(result)) < 0 || rpc_write_end(conn) < 0) {
+    return -1;
+  }
+  return 0;
+}
+
+int handle_manual_cuGraphExecHostNodeSetParams(conn_t *conn) {
+  CUgraphExec hGraphExec = nullptr;
+  CUgraphNode hNode = nullptr;
+  CUDA_HOST_NODE_PARAMS params{};
+  CUresult result = CUDA_ERROR_INVALID_VALUE;
+
+  if (rpc_read(conn, &hGraphExec, sizeof(hGraphExec)) < 0 ||
+      rpc_read(conn, &hNode, sizeof(hNode)) < 0 ||
+      rpc_read(conn, &params, sizeof(params)) < 0) {
+    return -1;
+  }
+  int request_id = rpc_read_end(conn);
+  if (request_id < 0) {
+    return -1;
+  }
+
+  auto *callback = lupine_make_host_setparams_callback(conn, params);
+  CUDA_HOST_NODE_PARAMS serverParams{};
+  serverParams.fn = lupine_graph_host_callback;
+  serverParams.userData = callback;
+  result = cuGraphExecHostNodeSetParams(hGraphExec, hNode, &serverParams);
+  if (rpc_write_start_response(conn, request_id) < 0 ||
+      rpc_write(conn, &result, sizeof(result)) < 0 || rpc_write_end(conn) < 0) {
+    return -1;
+  }
+  return 0;
+}
+
+int handle_manual_cuGraphHostNodeGetParams(conn_t *conn) {
+  CUgraphNode hNode = nullptr;
+  CUDA_HOST_NODE_PARAMS params{};
+  CUresult result = CUDA_ERROR_INVALID_VALUE;
+
+  if (rpc_read(conn, &hNode, sizeof(hNode)) < 0) {
+    return -1;
+  }
+  int request_id = rpc_read_end(conn);
+  if (request_id < 0) {
+    return -1;
+  }
+
+  result = cuGraphHostNodeGetParams(hNode, &params);
+  // Unwrap the trampoline so the client sees the fn/userData it registered.
+  if (result == CUDA_SUCCESS && params.fn == lupine_graph_host_callback &&
+      params.userData != nullptr) {
+    auto *callback = static_cast<lupine_host_callback_data *>(params.userData);
+    params.fn = callback->fn;
+    params.userData = callback->userData;
+  }
+  if (rpc_write_start_response(conn, request_id) < 0 ||
+      rpc_write(conn, &params, sizeof(params)) < 0 ||
       rpc_write(conn, &result, sizeof(result)) < 0 || rpc_write_end(conn) < 0) {
     return -1;
   }

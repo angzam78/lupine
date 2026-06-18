@@ -5,6 +5,20 @@ from typing import Optional, Union
 from dataclasses import dataclass
 import os
 import glob
+from ops import (
+    NullableOperation,
+    ArrayOperation,
+    InOutCountOperation,
+    OptionalArrayOperation,
+    DeepStructOperation,
+    NullTerminatedOperation,
+    OpaqueTypeOperation,
+    DereferenceOperation,
+    Operation,
+    OwnerAnnotation,
+    CrossServerCopyAnnotation,
+    FunctionAnnotationMetadata,
+)
 
 # this table is manually generated from the cuda.h headers
 MANUAL_REMAPPINGS = [
@@ -899,772 +913,6 @@ SKIP_FUNCTIONS = {
 }
 
 
-@dataclass
-class NullableOperation:
-    """
-    Nullable operations are operations that are passed as a pointer that can be null.
-    """
-
-    send: bool
-    recv: bool
-    parameter: Parameter
-    ptr: Pointer
-
-    def client_rpc_write(self, f):
-        if not self.send:
-            return
-        f.write(
-            "        rpc_write(conn, &{param_name}, sizeof({server_type})) < 0 ||\n".format(
-                param_name=self.parameter.name,
-                server_type=self.ptr.format(),
-            )
-        )
-
-        f.write(
-            "        ({param_name} != nullptr && rpc_write(conn, {param_name}, sizeof({base_type})) < 0) ||\n".format(
-                param_name=self.parameter.name,
-                # void is treated differently from non void pointer types
-                base_type=(
-                    self.ptr.format()
-                    if self.ptr.ptr_to.format() == "const void"
-                    else self.ptr.ptr_to.format()
-                ),
-            )
-        )
-
-    def client_unified_copy(self, f, direction, error):
-        f.write(
-            "    if (maybe_copy_unified_arg(conn, (void*){name}, cudaMemcpyDeviceToHost) < 0)\n".format(
-                name=self.parameter.name
-            )
-        )
-        f.write("      return {error};\n".format(error=error))
-
-    @property
-    def server_declaration(self) -> str:
-        c = self.ptr.ptr_to.const
-        self.ptr.ptr_to.const = False
-        # void is treated differently from non void pointer types
-        s = (
-            f"    {self.ptr.format()} {self.parameter.name}_null_check;\n"
-            + f"""    {self.ptr.format() if self.ptr.ptr_to.format() == "void" else self.ptr.ptr_to.format()} {self.parameter.name};\n"""
-        )
-        self.ptr.ptr_to.const = c
-        return s
-
-    def server_rpc_read(self, f):
-        if not self.send:
-            return
-        f.write(
-            "        rpc_read(conn, &{param_name}_null_check, sizeof({server_type})) < 0 ||\n".format(
-                param_name=self.parameter.name,
-                server_type=self.ptr.format(),
-            )
-        )
-        f.write(
-            "        ({param_name}_null_check && rpc_read(conn, &{param_name}, sizeof({base_type})) < 0) ||\n".format(
-                param_name=self.parameter.name,
-                # void is treated differently from non void pointer types
-                base_type=(
-                    self.ptr.format()
-                    if self.ptr.ptr_to.format() == "const void"
-                    else self.ptr.ptr_to.format()
-                ),
-            )
-        )
-
-    @property
-    def server_reference(self) -> str:
-        return f"{self.parameter.name}_null_check ? &{self.parameter.name} : nullptr"
-
-    def server_rpc_write(self, f):
-        if not self.recv:
-            return
-        f.write(
-            "        rpc_write(conn, &{param_name}_null_check, sizeof({server_type})) < 0 ||\n".format(
-                param_name=self.parameter.name,
-                server_type=self.ptr.format(),
-            )
-        )
-        f.write(
-            "        ({param_name}_null_check && rpc_write(conn, &{param_name}, sizeof({base_type})) < 0) ||\n".format(
-                param_name=self.parameter.name,
-                base_type=self.ptr.ptr_to.format(),
-            )
-        )
-
-    def client_rpc_read(self, f):
-        if not self.recv:
-            return
-        f.write(
-            "        rpc_read(conn, &{param_name}_null_check, sizeof({server_type})) < 0 ||\n".format(
-                param_name=self.parameter.name,
-                server_type=self.ptr.format(),
-            )
-        )
-        f.write(
-            "        ({param_name}_null_check && rpc_read(conn, {param_name}, sizeof({base_type})) < 0) ||\n".format(
-                param_name=self.parameter.name,
-                base_type=self.ptr.ptr_to.format(),
-            )
-        )
-
-
-@dataclass
-class ArrayOperation:
-    """
-    Array operations are operations that are passed as a pointer to an array.
-    """
-
-    send: bool
-    recv: bool
-    iter: bool
-    parameter: Parameter
-    ptr: Pointer
-    # if int, it's a constant length, if Parameter, it's a variable length.
-    length: Union[int, Parameter]
-    # compressible payloads use the rpc_*_payload helpers which optionally
-    # apply LZ4 framing for large transfers (see compress.cpp).
-    compressible: bool = False
-
-    @property
-    def is_void_bytes(self) -> bool:
-        return self.ptr.ptr_to.format() in ("void", "const void")
-
-    def byte_count_expr(self) -> str:
-        if isinstance(self.length, int):
-            return str(self.length)
-        if isinstance(self.length.type, Pointer):
-            return f"*{self.length.name}"
-        return self.length.name
-
-    def element_count_expr(self) -> str:
-        if isinstance(self.length, int):
-            return str(self.length)
-        if isinstance(self.length.type, Pointer):
-            return f"*{self.length.name}"
-        return self.length.name
-
-    def transfer_size_expr(self) -> str:
-        if self.is_void_bytes:
-            return self.byte_count_expr()
-        return f"{self.element_count_expr()} * sizeof({self.ptr.ptr_to.format()})"
-
-    def mutable_ptr_format(self) -> str:
-        c = self.ptr.ptr_to.const
-        self.ptr.ptr_to.const = False
-        result = self.ptr.format()
-        self.ptr.ptr_to.const = c
-        return result
-
-    def client_rpc_write(self, f):
-        if self.iter:
-            loop_template = """
-                [=]() -> bool {{
-                    for (size_t i = 0; i < {length}; ++i) {{
-                        if (rpc_write(0, &{param_name}[i], sizeof({param_type})) < 0) {{
-                            printf("Failed to write Dependency[%zu]\\n", i);
-                            return false;
-                        }}
-                    }}
-                    return true;
-                }}() == false ||
-                """.strip()
-
-            f.write(loop_template.format(
-                length=self.length.name,
-                param_type=self.ptr.ptr_to.format(),
-                param_name=self.parameter.name,
-            ))
-            return
-
-        if not self.send:
-            return
-        if isinstance(self.length, int):
-            f.write(
-                "        ({size} != 0 && rpc_write(conn, {param_name}, {size}) < 0) ||\n".format(
-                    param_name=self.parameter.name,
-                    size=self.length,
-                )
-            )
-        # array length operations are handled differently than char
-        elif isinstance(self.ptr, Array):
-            f.write(
-                "        rpc_write(conn, &{param_name}, sizeof({param_type})) < 0 ||\n".format(
-                    param_name=self.parameter.name,
-                    param_type=self.ptr.array_of.format(),
-                )
-            )
-        else:
-            f.write(
-                "        ({size} != 0 && {param_name} == nullptr) ||\n".format(
-                    param_name=self.parameter.name,
-                    size=self.transfer_size_expr(),
-                )
-            )
-            f.write(
-                "        ({size} != 0 && {write_fn}(conn, {param_name}, {size}) < 0) ||\n".format(
-                    write_fn="rpc_write_payload" if self.compressible else "rpc_write",
-                    param_name=self.parameter.name,
-                    size=self.transfer_size_expr(),
-                )
-            )
-
-    def client_prepare_rpc_read(self, f):
-        if not self.recv:
-            return
-        f.write(
-            "        (lupine_prepare_host_range_write({param_name}, {size}), false) ||\n".format(
-                param_name=self.parameter.name,
-                size=self.transfer_size_expr(),
-            )
-        )
-
-    def client_post_rpc_read_success(self, f):
-        if not self.recv:
-            return
-        f.write(
-            "    if (return_value == CUDA_SUCCESS) lupine_mark_host_range_clean({param_name}, {size});\n".format(
-                param_name=self.parameter.name,
-                size=self.transfer_size_expr(),
-            )
-        )
-
-    def client_unified_copy(self, f, direction, error):
-        f.write(
-            "    if (maybe_copy_unified_arg(conn, (void*){name}, {direction}) < 0)\n".format(
-                name=self.parameter.name, direction=direction
-            )
-        )
-        f.write("      return {error};\n".format(error=error))
-
-        if isinstance(self.length, int):
-            f.write(
-                "    for (int i = 0; i < {name} && is_unified_pointer(conn, (void*){param}); i++)\n".format(
-                    param=self.parameter.name, name=self.length
-                )
-            )
-            f.write(
-                "      if (maybe_copy_unified_arg(conn, (void*)&{name}[i], {direction}) < 0 )\n".format(
-                    name=self.parameter.name, direction=direction
-                )
-            )
-            f.write("        return {error};\n".format(error=error))
-
-            return
-
-        if hasattr(self.length.type, "ptr_to"):
-            # need to cast the int a bit differently here
-            f.write(
-                "    for (int i = 0; i < static_cast<int>(*{name}) && is_unified_pointer(conn, (void*){param}); i++)\n".format(
-                    param=self.parameter.name, name=self.length.name
-                )
-            )
-            f.write(
-                "      if (maybe_copy_unified_arg(conn, (void*)&{name}[i], {direction}) < 0)\n".format(
-                    name=self.parameter.name, direction=direction
-                )
-            )
-            f.write("        return {error};\n".format(error=error))
-        else:
-            if hasattr(self.parameter.type, "ptr_to"):
-                f.write(
-                    "    for (int i = 0; i < static_cast<int>({name}) && is_unified_pointer(conn, (void*){param}); i++)\n".format(
-                        param=self.parameter.name, name=self.length.name
-                    )
-                )
-                f.write(
-                    "      if (maybe_copy_unified_arg(conn, (void*)&{name}[i], {direction}) < 0)\n".format(
-                        name=self.parameter.name, direction=direction
-                    )
-                )
-                f.write("        return {error};\n".format(error=error))
-            else:
-                f.write(
-                    "    for (int i = 0; i < static_cast<int>({name}) && is_unified_pointer(conn, (void*){param}); i++)\n".format(
-                        param=self.parameter.name, name=self.length.name
-                    )
-                )
-                f.write(
-                    "      if (maybe_copy_unified_arg(conn, (void*){name}[i], {direction}) < 0)\n".format(
-                        name=self.parameter.name, direction=direction
-                    )
-                )
-                f.write("        return {error};\n".format(error=error))
-
-    @property
-    def server_declaration(self) -> str:
-        if isinstance(self.ptr, Array):
-            c = self.ptr.array_of.const
-            self.ptr.array_of.const = False
-            s = f"    {self.ptr.array_of.format()}* {self.parameter.name} = nullptr;\n"
-            self.ptr.array_of.const = c
-        elif self.iter:
-            c = self.ptr.ptr_to.const
-            self.ptr.ptr_to.const = False
-            s = f"    std::vector<{self.ptr.ptr_to.format()}> {self.parameter.name};\n"
-            self.ptr.ptr_to.const = c
-        else:
-            c = self.ptr.ptr_to.const
-            self.ptr.ptr_to.const = False
-            s = f"    {self.ptr.format()} {self.parameter.name};\n"
-            if self.send:
-                s += f"    size_t {self.parameter.name}_size;\n"
-            self.ptr.ptr_to.const = c
-        return s
-
-    def server_rpc_read(self, f, index) -> Optional[str]:
-        if self.iter:
-            lambda_template = """
-            [=, &{param_name}]() -> bool {{
-                {param_name}.resize({length});  // Resize the dependencies vector
-                for (size_t i = 0; i < {length}; ++i) {{
-                    if (rpc_read(conn, &{param_name}[i], sizeof({param_type})) < 0) {{
-                        return false;
-                    }}
-                }}
-                return true;
-            }}() == false ||
-            """.strip()
-
-            f.write(lambda_template.format(
-                param_name=self.parameter.name,
-                length=self.length.name,
-                param_type=self.ptr.ptr_to.format(),
-            ))
-            return
-
-        if not self.send:
-            # if this parameter is recv only and it's a type pointer, it needs to be malloc'd.
-            if isinstance(self.ptr, Pointer):
-                f.write("        false)\n")
-                f.write("        goto ERROR_{index};\n".format(index=index))
-                f.write(
-                    "    {param_name} = ({server_type})malloc({size});\n".format(
-                        param_name=self.parameter.name,
-                        server_type=self.ptr.format(),
-                        size=self.transfer_size_expr(),
-                    )
-                )
-                f.write("    if(")
-                return self.parameter.name
-            return
-        elif isinstance(self.ptr, Pointer):
-            f.write("        false)\n")
-            f.write("        goto ERROR_{index};\n".format(index=index))
-            f.write(
-                "    {param_name}_size = {size};\n".format(
-                    param_name=self.parameter.name,
-                    size=self.transfer_size_expr(),
-                )
-            )
-            f.write(
-                "    {param_name} = ({server_type})malloc({size});\n".format(
-                    param_name=self.parameter.name,
-                    server_type=self.mutable_ptr_format(),
-                    size=f"{self.parameter.name}_size",
-                )
-            )
-            f.write(
-                "    if ({param_name}_size != 0 && {param_name} == nullptr)\n".format(
-                    param_name=self.parameter.name
-                )
-            )
-            f.write("        goto ERROR_{index};\n".format(index=index))
-            f.write("    if(\n")
-            f.write(
-                "        ({size} != 0 && {read_fn}(conn, {param_name}, {size}) < 0) ||\n".format(
-                    read_fn="rpc_read_payload" if self.compressible else "rpc_read",
-                    param_name=self.parameter.name,
-                    size=f"{self.parameter.name}_size",
-                )
-            )
-            defer = self.parameter.name
-        elif isinstance(self.length, int):
-            f.write(
-                "        rpc_read(conn, &{param_name}, {size}) < 0 ||\n".format(
-                    param_name=self.parameter.name,
-                    size=self.length,
-                )
-            )
-        elif isinstance(self.ptr, Array):
-            f.write(
-                "        rpc_read(conn, &{param_name}, sizeof({param_type}*)) < 0 ||\n".format(
-                    param_name=self.parameter.name,
-                    param_type=self.ptr.array_of.format(),
-                )
-            )
-        else:
-            f.write(
-                "        rpc_read(conn, {param_name}, {size}) < 0 ||\n".format(
-                    param_name=self.parameter.name,
-                    size=self.transfer_size_expr(),
-                )
-            )
-        if 'defer' in locals():
-            return defer
-
-    @property
-    def server_reference(self) -> str:
-        if self.iter:
-            return f"{self.parameter.name}.data()"
-        if isinstance(self.length, int):
-            return f"{self.parameter.name}"
-        return f"({self.transfer_size_expr()} == 0 ? nullptr : {self.parameter.name})"
-
-    def server_rpc_write(self, f):
-        if not self.recv:
-            return
-        if isinstance(self.length, int):
-            f.write(
-                "        ({size} != 0 && rpc_write(conn, {param_name}, {size}) < 0) ||\n".format(
-                    param_name=self.parameter.name,
-                    size=self.length,
-                )
-            )
-        else:
-            f.write(
-                "        ({size} != 0 && {write_fn}(conn, {param_name}, {size}) < 0) ||\n".format(
-                    write_fn="rpc_write_payload" if self.compressible else "rpc_write",
-                    param_name=self.parameter.name,
-                    size=self.transfer_size_expr(),
-                )
-            )
-
-    def client_rpc_read(self, f):
-        if not self.recv:
-            return
-        if isinstance(self.length, int):
-            f.write(
-                "        ({size} != 0 && rpc_read(conn, {param_name}, {size}) < 0) ||\n".format(
-                    param_name=self.parameter.name,
-                    size=self.length,
-                )
-            )
-        else:
-            f.write(
-                "        ({size} != 0 && {read_fn}(conn, {param_name}, {size}) < 0) ||\n".format(
-                    read_fn="rpc_read_payload" if self.compressible else "rpc_read",
-                    param_name=self.parameter.name,
-                    size=self.transfer_size_expr(),
-                )
-            )
-
-
-@dataclass
-class NullTerminatedOperation:
-    """
-    Null terminated operations are operations that are passed as a null terminated string.
-    """
-
-    send: bool
-    recv: bool
-    parameter: Parameter
-    ptr: Pointer
-
-    def client_rpc_write(self, f):
-        if not self.send:
-            return
-        f.write(
-            "        rpc_write(conn, &{param_name}_len, sizeof(std::size_t)) < 0 ||\n".format(
-                param_name=self.parameter.name,
-            )
-        )
-        f.write(
-            "        rpc_write(conn, {param_name}, {param_name}_len) < 0 ||\n".format(
-                param_name=self.parameter.name,
-            )
-        )
-
-    @property
-    def server_declaration(self) -> str:
-        return (
-            f"    {self.ptr.format()} {self.parameter.name};\n"
-            + f"    std::size_t {self.parameter.name}_len;\n"
-        )
-
-    def client_unified_copy(self, f, direction, error):
-        f.write(
-            "    if (maybe_copy_unified_arg(conn, (void*){name}, {direction}) < 0)\n".format(
-                name=self.parameter.name, direction=direction
-            )
-        )
-        f.write("      return {error};\n".format(error=error))
-
-    def server_rpc_read(self, f, index) -> Optional[str]:
-        if not self.send:
-            return
-        f.write(
-            "        rpc_read(conn, &{param_name}_len, sizeof(std::size_t)) < 0)\n".format(
-                param_name=self.parameter.name
-            )
-        )
-        f.write("        goto ERROR_{index};\n".format(index=index))
-        f.write(
-            "    {param_name} = ({server_type})malloc({param_name}_len);\n".format(
-                param_name=self.parameter.name,
-                server_type=self.ptr.format(),
-            )
-        )
-        f.write(
-            "    if (rpc_read(conn, (void *){param_name}, {param_name}_len) < 0 ||\n".format(
-                param_name=self.parameter.name
-            )
-        )
-        return self.parameter.name
-
-    @property
-    def server_reference(self) -> str:
-        return self.parameter.name
-
-    def server_rpc_write(self, f):
-        if not self.recv:
-            return
-        f.write(
-            "        rpc_write(conn, &{param_name}_len, sizeof(std::size_t)) < 0 ||\n".format(
-                param_name=self.parameter.name,
-            )
-        )
-        f.write(
-            "        rpc_write(conn, {param_name}, {param_name}_len) < 0 ||\n".format(
-                param_name=self.parameter.name,
-            )
-        )
-
-    def client_rpc_read(self, f):
-        if not self.recv:
-            return
-        f.write(
-            "        rpc_read(conn, &{param_name}_len, sizeof(std::size_t)) < 0 ||\n".format(
-                param_name=self.parameter.name
-            )
-        )
-        f.write(
-            "        rpc_read(conn, {param_name}, {param_name}_len) < 0 ||\n".format(
-                param_name=self.parameter.name
-            )
-        )
-
-
-@dataclass
-class OpaqueTypeOperation:
-    """
-    Opaque type operations are operations that are passed as an opaque type. That is, the
-    data is written directly without any additional dereferencing.
-    """
-
-    send: bool
-    recv: bool
-    parameter: Parameter
-    type_: Union[Type, Pointer]
-
-    def is_sent_cufunction(self) -> bool:
-        type_name = self.type_.format().replace("const ", "").strip()
-        return self.send and type_name == "CUfunction"
-
-    def client_declaration(self) -> str:
-        if self.is_sent_cufunction():
-            return (
-                f"    CUfunction {self.parameter.name}_rpc = "
-                f"lupine_translate_private_function_for_rpc({self.parameter.name});\n"
-            )
-        return ""
-
-    def client_rpc_write(self, f):
-        if not self.send:
-            return
-        else:
-            param_name = (
-                f"{self.parameter.name}_rpc"
-                if self.is_sent_cufunction()
-                else self.parameter.name
-            )
-            f.write(
-                "        rpc_write(conn, &{param_name}, sizeof({param_type})) < 0 ||\n".format(
-                    param_name=param_name,
-                    param_type=self.type_.format(),
-                )
-            )
-
-    @property
-    def server_declaration(self) -> str:
-        if isinstance(self.type_, Pointer) and self.recv:
-            return f"    {self.type_.ptr_to.format()} {self.parameter.name};\n"
-        # ensure we don't have a const struct, otherwise we can't initialise it properly; ex: "const cudnnTensorDescriptor_t xDesc;" is invalid...
-        # but "const cudnnTensorDescriptor_t *xDesc" IS valid. This subtle change carries reprecussions.
-        elif (
-            "const " in self.type_.format()
-            and "void" not in self.type_.format()
-            and "*" not in self.type_.format()
-        ):
-            return f"   {self.type_.format().replace('const', '')} {self.parameter.name};\n"
-        else:
-            return f"    {self.type_.format()} {self.parameter.name};\n"
-
-    def client_unified_copy(self, f, direction, error):
-        if isinstance(self.type_, Pointer):
-            f.write(
-                "    if (maybe_copy_unified_arg(conn, (void*){name}, {direction}) < 0)\n".format(
-                    name=self.parameter.name, direction=direction
-                )
-            )
-            f.write("      return {error};\n".format(error=error))
-        else:
-            f.write(
-                "    if (maybe_copy_unified_arg(conn, (void*)&{name}, {direction}) < 0)\n".format(
-                    name=self.parameter.name, direction=direction
-                )
-            )
-            f.write("      return {error};\n".format(error=error))
-
-    def server_rpc_read(self, f):
-        if not self.send:
-            return
-        f.write(
-            "        rpc_read(conn, &{param_name}, sizeof({param_type})) < 0 ||\n".format(
-                param_name=self.parameter.name,
-                param_type=self.type_.format(),
-            )
-        )
-
-    @property
-    def server_reference(self) -> str:
-        if self.recv:
-            return f"&{self.parameter.name}"
-        return self.parameter.name
-
-    def server_rpc_write(self, f):
-        if not self.recv:
-            return
-        f.write(
-            "        rpc_write(conn, &{param_name}, sizeof({param_type})) < 0 ||\n".format(
-                param_name=self.parameter.name,
-                param_type=self.type_.format(),
-            )
-        )
-
-    def client_rpc_read(self, f):
-        if not self.recv:
-            return
-        f.write(
-            "        rpc_read(conn, &{param_name}, sizeof({param_type})) < 0 ||\n".format(
-                param_name=self.parameter.name,
-                param_type=self.type_.format(),
-            )
-        )
-
-
-@dataclass
-class DereferenceOperation:
-    """
-    Opaque type operations are operations that are passed as an opaque type. That is, the
-    data is written directly without any additional dereferencing.
-    """
-
-    send: bool
-    recv: bool
-    parameter: Parameter
-    type_: Pointer
-
-    def client_rpc_write(self, f):
-        if not self.send:
-            return
-        f.write(
-            "        rpc_write(conn, {param_name}, sizeof({param_type})) < 0 ||\n".format(
-                param_name=self.parameter.name,
-                param_type=self.type_.ptr_to.format(),
-            )
-        )
-
-    @property
-    def server_declaration(self) -> str:
-        c = self.type_.ptr_to.const
-        self.type_.ptr_to.const = False
-        result = f"    {self.type_.ptr_to.format()} {self.parameter.name};\n"
-        self.type_.ptr_to.const = c
-        return result
-
-    def server_rpc_read(self, f):
-        if not self.send:
-            return
-        f.write(
-            "        rpc_read(conn, &{param_name}, sizeof({param_type})) < 0 ||\n".format(
-                param_name=self.parameter.name,
-                param_type=self.type_.ptr_to.format(),
-            )
-        )
-
-    def client_unified_copy(self, f, direction, error):
-        f.write(
-            "    if (maybe_copy_unified_arg(conn, (void*){name}, {direction}) < 0)\n".format(
-                name=self.parameter.name, direction=direction
-            )
-        )
-        f.write("      return {error};\n".format(error=error))
-
-    @property
-    def server_reference(self) -> str:
-        return f"&{self.parameter.name}"
-
-    def server_rpc_write(self, f):
-        if not self.recv:
-            return
-        f.write(
-            "        rpc_write(conn, &{param_name}, sizeof({param_type})) < 0 ||\n".format(
-                param_name=self.parameter.name,
-                param_type=self.type_.ptr_to.format(),
-            )
-        )
-
-    def client_rpc_read(self, f):
-        if not self.recv:
-            return
-        # if this parameter is recv only then dereference it.
-        f.write(
-            "        rpc_read(conn, {param_name}, sizeof({param_type})) < 0 ||\n".format(
-                param_name=self.parameter.name,
-                param_type=self.type_.ptr_to.format(),
-            )
-        )
-
-
-Operation = Union[
-    NullableOperation,
-    ArrayOperation,
-    NullTerminatedOperation,
-    OpaqueTypeOperation,
-    DereferenceOperation,
-]
-
-
-@dataclass
-class OwnerAnnotation:
-    kind: str
-    parameter: Parameter
-
-
-@dataclass
-class CrossServerCopyAnnotation:
-    dst: Parameter
-    src: Parameter
-    bytes: Parameter
-    stream: Optional[Parameter] = None
-    async_: bool = False
-
-
-@dataclass
-class FunctionAnnotationMetadata:
-    operations: list[Operation]
-    disabled: bool = False
-    routing_kind: Optional[str] = None
-    routing_parameter: Optional[Parameter] = None
-    record_owners: list[OwnerAnnotation] = None
-    cross_server_copy: Optional[CrossServerCopyAnnotation] = None
-
-    def __post_init__(self):
-        if self.record_owners is None:
-            self.record_owners = []
-
 
 def annotation_param(params: list[Parameter], name: str) -> Parameter:
     try:
@@ -1705,6 +953,9 @@ def parse_annotation(
 ) -> FunctionAnnotationMetadata:
     operations: list[Operation] = []
     metadata = FunctionAnnotationMetadata(operations=operations)
+    # @deeparray <param> <array_member> <count_member> entries, grouped by the
+    # struct-pointer param they describe (see DeepStructOperation).
+    deep_arrays: dict[str, list[tuple[str, str]]] = {}
 
     if not annotation:
         metadata.routing_kind, metadata.routing_parameter = infer_routing_key(params)
@@ -1757,6 +1008,13 @@ def parse_annotation(
                 async_="ASYNC" in parts[4:],
             )
             continue
+        if line.startswith("@deeparray"):
+            # @deeparray <param> <array_member> <count_member>
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            deep_arrays.setdefault(parts[1], []).append((parts[2], parts[3]))
+            continue
         if line.startswith("@param"):
             parts = line.split()
 
@@ -1803,17 +1061,29 @@ def parse_annotation(
                     length_param = next(
                         p for p in params if p.name == length_arg.split(":")[1]
                     )
-                    operations.append(
-                        ArrayOperation(
-                            send=send,
-                            recv=recv,
-                            parameter=param,
-                            ptr=param.type,
-                            length=length_param,
-                            iter=False,
-                            compressible="COMPRESSIBLE" in args,
+                    if "OPTIONAL" in args:
+                        # optional out-array sized by an in/out count param (the
+                        # cuGraphGetNodes query pattern); linked to its count in
+                        # the post-pass below.
+                        operations.append(
+                            OptionalArrayOperation(
+                                parameter=param,
+                                ptr=param.type,
+                                count=length_param,
+                            )
                         )
-                    )
+                    else:
+                        operations.append(
+                            ArrayOperation(
+                                send=send,
+                                recv=recv,
+                                parameter=param,
+                                ptr=param.type,
+                                length=length_param,
+                                iter=False,
+                                compressible="COMPRESSIBLE" in args,
+                            )
+                        )
                 elif size_arg:
                     # if it has a size, it's an array operation with constant length
                     operations.append(
@@ -1998,6 +1268,40 @@ def parse_annotation(
             )
         else:
             raise NotImplementedError("Unknown type")
+    # Promote the count param of any optional out-array to an
+    # InOutCountOperation. Several arrays may share one count (cuGraphGetEdges);
+    # the first one is the anchor whose presence the client uses to decide
+    # between a count-only query and a fill.
+    optional_ops = [op for op in operations if isinstance(op, OptionalArrayOperation)]
+    if optional_ops:
+        anchors: dict[str, str] = {}
+        for op in optional_ops:
+            anchors.setdefault(op.count.name, op.parameter.name)
+        for count_name, anchor in anchors.items():
+            for i, op in enumerate(operations):
+                if op.parameter.name == count_name and isinstance(
+                    op, DereferenceOperation
+                ):
+                    operations[i] = InOutCountOperation(
+                        send=True,
+                        recv=True,
+                        parameter=op.parameter,
+                        anchor=anchor,
+                    )
+                    break
+    # Promote any param with @deeparray entries to a DeepStructOperation,
+    # inheriting the send/recv direction from its @param line.
+    for pname, members in deep_arrays.items():
+        for i, op in enumerate(operations):
+            if op.parameter.name == pname:
+                operations[i] = DeepStructOperation(
+                    send=getattr(op, "send", True),
+                    recv=getattr(op, "recv", False),
+                    parameter=op.parameter,
+                    ptr=op.parameter.type,
+                    members=members,
+                )
+                break
     if metadata.routing_kind is None:
         metadata.routing_kind, metadata.routing_parameter = infer_routing_key(params)
     return metadata
@@ -2310,7 +1614,10 @@ def main():
             '#include "rpc.h"\n\n'
             "extern int rpc_size();\n"
             "extern conn_t *rpc_client_get_connection(unsigned int index);\n"
-            "extern void rpc_close(conn_t *conn);\n\n"
+            "extern void rpc_close(conn_t *conn);\n"
+            'extern "C" void lupine_deep_cache_reset(const void *key);\n'
+            'extern "C" void *lupine_deep_cache_add(const void *key, '
+            "size_t bytes);\n\n"
             "struct lupine_route {\n"
             "    int kind;\n"
             "    conn_t *conn;\n"
@@ -2367,8 +1674,6 @@ def main():
             '                                                   size_t ByteCount,\n'
             '                                                   CUstream hStream,\n'
             '                                                   bool async);\n\n'
-            'extern "C" CUresult lupine_cuArrayCreate_v2_safe(CUarray *pHandle, const CUDA_ARRAY_DESCRIPTOR *pAllocateArray);\n'
-            'extern "C" CUresult lupine_cuArray3DCreate_v2_safe(CUarray *pHandle, const CUDA_ARRAY3D_DESCRIPTOR *pAllocateArray);\n'
             'extern "C" CUresult lupine_cuLinkCreate_v2_safe(unsigned int numOptions, CUjit_option *options, void **optionValues, CUlinkState *stateOut);\n'
             'extern "C" CUresult lupine_cuLinkAddData_v2_safe(CUlinkState state, CUjitInputType type, void *data, size_t size, const char *name, unsigned int numOptions, CUjit_option *options, void **optionValues);\n'
             'extern "C" CUresult lupine_cuLinkAddFile_v2_safe(CUlinkState state, CUjitInputType type, const char *path, unsigned int numOptions, CUjit_option *options, void **optionValues);\n'
@@ -2436,8 +1741,6 @@ def main():
                 "cuKernelGetFunction": "lupine_cuKernelGetFunction_cached(pFunc, kernel)",
                 "cuMemFree_v2": "lupine_cuMemFree_v2_safe(dptr)",
                 "cuMemAllocManaged": "lupine_cuMemAllocManaged_safe(dptr, bytesize, flags)",
-                "cuArrayCreate_v2": "lupine_cuArrayCreate_v2_safe(pHandle, pAllocateArray)",
-                "cuArray3DCreate_v2": "lupine_cuArray3DCreate_v2_safe(pHandle, pAllocateArray)",
                 "cuLinkCreate_v2": "lupine_cuLinkCreate_v2_safe(numOptions, options, optionValues, stateOut)",
                 "cuLinkAddData_v2": "lupine_cuLinkAddData_v2_safe(state, type, data, size, name, numOptions, options, optionValues)",
                 "cuLinkAddFile_v2": "lupine_cuLinkAddFile_v2_safe(state, type, path, numOptions, options, optionValues)",
@@ -2561,6 +1864,12 @@ def main():
 
             for operation in operations:
                 if isinstance(operation, OpaqueTypeOperation):
+                    f.write(operation.client_declaration())
+                if (
+                    isinstance(operation, InOutCountOperation)
+                    or isinstance(operation, OptionalArrayOperation)
+                    or isinstance(operation, DeepStructOperation)
+                ):
                     f.write(operation.client_declaration())
 
             # compute the strlen's for null-terminated operations.
@@ -2744,8 +2053,10 @@ def main():
 
             f.write("    if (\n")
             for operation in operations:
-                if isinstance(operation, NullTerminatedOperation) or isinstance(
-                    operation, ArrayOperation
+                if (
+                    isinstance(operation, NullTerminatedOperation)
+                    or isinstance(operation, ArrayOperation)
+                    or isinstance(operation, OptionalArrayOperation)
                 ):
                     if error := operation.server_rpc_read(f, len(defers)):
                         defers.append(error)
