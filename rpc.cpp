@@ -2,8 +2,11 @@
 #include <algorithm>
 #include <climits>
 #include <cstdlib>
+#include <functional>
 #include <iostream>
 #include <string.h>
+#include <thread>
+#include <vector>
 
 static int rpc_write_queue_reserve(conn_t *conn, int capacity) {
   if (conn == nullptr || capacity < 0) {
@@ -64,43 +67,93 @@ void rpc_write_queue_free(conn_t *conn) {
   conn->write_queue_capacity = 0;
 }
 
+int rpc_write_lane_termination(conn_t *conn, uint64_t lane_id) {
+  if (conn == nullptr || conn->closed) {
+    return -1;
+  }
+  if (pthread_mutex_lock(&conn->call_mutex) != 0) {
+    return -1;
+  }
+  if (pthread_mutex_lock(&conn->write_mutex) != 0) {
+    pthread_mutex_unlock(&conn->call_mutex);
+    return -1;
+  }
+  conn->request_id = conn->request_id + 2;
+  conn->write_id = conn->request_id;
+  conn->write_op = LUPINE_RPC_TERMINATE_LANE;
+  int result = -1;
+  if (rpc_write_queue_reset(conn, 3) == 0) {
+    conn->write_queue[0] = {{&conn->write_id, sizeof(conn->write_id)}, 0};
+    conn->write_queue[1] = {{&lane_id, sizeof(lane_id)}, 0};
+    conn->write_queue[2] = {{&conn->write_op, sizeof(conn->write_op)}, 0};
+    result = rpc_http2_writev(conn, conn->write_queue, conn->write_queue_count);
+  }
+  pthread_mutex_unlock(&conn->write_mutex);
+  pthread_mutex_unlock(&conn->call_mutex);
+  return result;
+}
+
+#ifdef LUPINE_RPC_CLIENT
+extern void rpc_destroy_thread_lane(uint64_t lane_id);
+#else
+static void rpc_destroy_thread_lane(uint64_t lane_id) { (void)lane_id; }
+#endif
+
+namespace {
+
+struct rpc_thread_lane {
+  uint64_t id = static_cast<uint64_t>(
+      std::hash<std::thread::id>{}(std::this_thread::get_id()));
+
+  ~rpc_thread_lane() { rpc_destroy_thread_lane(id); }
+};
+
+static thread_local rpc_thread_lane rpc_tls_lane;
+
+uint64_t rpc_thread_lane_id(conn_t *conn) {
+  (void)conn;
+  return rpc_tls_lane.id;
+}
+
+} // namespace
+
 void *_rpc_read_id_dispatch(void *p) {
   conn_t *conn = (conn_t *)p;
 
-  if (pthread_mutex_lock(&conn->read_mutex) < 0)
-    return NULL;
-
   while (!conn->closed) {
-    while (conn->read_id != 0 && !conn->closed)
-      pthread_cond_wait(&conn->read_cond, &conn->read_mutex);
-    if (conn->closed)
-      break;
-
-    // the read id is zero so it's our turn to read the next int which is the
-    // request id of the next request. rpc_read returns the byte count on
-    // success (here sizeof(int)) and <0 on failure, so treat anything but a
-    // full read or a zero id as a closed connection.
-    if (rpc_read(conn, &conn->read_id, sizeof(int)) != sizeof(int) ||
-        conn->read_id == 0) {
-      conn->closed = 1;
-      pthread_cond_broadcast(&conn->read_cond);
+    if (pthread_mutex_lock(&conn->read_mutex) != 0) {
       break;
     }
-    if (pthread_cond_broadcast(&conn->read_cond) < 0)
+    while (conn->read_id != 0 && !conn->closed) {
+      pthread_cond_wait(&conn->read_cond, &conn->read_mutex);
+    }
+    if (conn->closed) {
+      pthread_mutex_unlock(&conn->read_mutex);
       break;
+    }
+
+    int request_id = 0;
+    if (rpc_http2_read(conn, &request_id, sizeof(request_id)) !=
+            sizeof(request_id) ||
+        request_id == 0) {
+      conn->closed = 1;
+      pthread_cond_broadcast(&conn->read_cond);
+      pthread_mutex_unlock(&conn->read_mutex);
+      break;
+    }
+
+    conn->read_id = request_id;
+    if (pthread_cond_broadcast(&conn->read_cond) < 0 ||
+        pthread_mutex_unlock(&conn->read_mutex) < 0) {
+      break;
+    }
   }
-  pthread_mutex_unlock(&conn->read_mutex);
+  conn->closed = 1;
+  pthread_cond_broadcast(&conn->read_cond);
   conn->rpc_thread = 0;
   return NULL;
 }
 
-// rpc_read_start waits for a response with a specific request id on the
-// given connection. this function is used to wait for a response to a
-// request that was sent with rpc_write_end.
-//
-// it is not necessary to call rpc_read_start() if it is the first call in
-// the sequence because by convention, the handler owns the read lock on
-// entry.
 int rpc_dispatch(conn_t *conn, int parity) {
   if (conn->rpc_thread == 0 &&
       pthread_create(&conn->rpc_thread, nullptr, _rpc_read_id_dispatch,
@@ -112,44 +165,62 @@ int rpc_dispatch(conn_t *conn, int parity) {
     return -1;
   }
 
-  int op;
-
-  while (!conn->closed && (conn->read_id < 2 || conn->read_id % 2 != parity))
+  while (!conn->closed &&
+         (conn->read_id < 2 || conn->read_id % 2 != parity)) {
     pthread_cond_wait(&conn->read_cond, &conn->read_mutex);
+  }
 
   if (conn->closed) {
     pthread_mutex_unlock(&conn->read_mutex);
     return -1;
   }
 
-  if (rpc_read(conn, &op, sizeof(int)) < 0) {
+  if (rpc_http2_read(conn, &conn->read_lane_id, sizeof(conn->read_lane_id)) !=
+          sizeof(conn->read_lane_id) ||
+      rpc_http2_read(conn, &conn->read_op, sizeof(conn->read_op)) !=
+          sizeof(conn->read_op)) {
+    conn->closed = 1;
+    pthread_cond_broadcast(&conn->read_cond);
     pthread_mutex_unlock(&conn->read_mutex);
     return -1;
   }
-
-  return op;
+  pthread_mutex_unlock(&conn->read_mutex);
+  return conn->read_op;
 }
 
 // rpc_read_start waits for a response with a specific request id on the
 // given connection. this function is used to wait for a response to a request
 // that was sent with rpc_write_end.
 //
-// it is not necessary to call rpc_read_start() if it is the first call in
-// the sequence because by convention, the handler owns the read lock on entry.
+// Once this returns, the matching frame is reserved for the caller until
+// rpc_read_end() releases it back to the dispatch thread.
 int rpc_read_start(conn_t *conn, int write_id) {
   if (pthread_mutex_lock(&conn->read_mutex) < 0)
     return -1;
 
-  // wait for the active read id to be the request id we are waiting for
-  while (!conn->closed && conn->read_id != write_id)
-    if (pthread_cond_wait(&conn->read_cond, &conn->read_mutex) < 0)
+  while (!conn->closed && conn->read_id != write_id) {
+    if (pthread_cond_wait(&conn->read_cond, &conn->read_mutex) != 0) {
+      pthread_mutex_unlock(&conn->read_mutex);
       return -1;
+    }
+  }
 
   if (conn->closed) {
     pthread_mutex_unlock(&conn->read_mutex);
     return -1;
   }
 
+  if (rpc_http2_read(conn, &conn->read_lane_id, sizeof(conn->read_lane_id)) !=
+          sizeof(conn->read_lane_id) ||
+      rpc_http2_read(conn, &conn->read_op, sizeof(conn->read_op)) !=
+              sizeof(conn->read_op) ||
+      conn->read_op != -1) {
+    conn->closed = 1;
+    pthread_cond_broadcast(&conn->read_cond);
+    pthread_mutex_unlock(&conn->read_mutex);
+    return -1;
+  }
+  pthread_mutex_unlock(&conn->read_mutex);
   return 0;
 }
 
@@ -170,17 +241,16 @@ int rpc_drain(conn_t *conn, size_t size) {
   return 0;
 }
 
-// rpc_read_end releases the response lock on the given connection.
 int rpc_read_end(conn_t *conn) {
+  if (pthread_mutex_lock(&conn->read_mutex) != 0) {
+    return -1;
+  }
   int read_id = conn->read_id;
-  bool completes_local_request =
-      read_id >= 2 && (read_id % 2) == conn->local_request_parity;
   conn->read_id = 0;
   if (pthread_cond_broadcast(&conn->read_cond) < 0 ||
-      pthread_mutex_unlock(&conn->read_mutex) < 0)
+      pthread_mutex_unlock(&conn->read_mutex) < 0) {
     return -1;
-  if (completes_local_request && pthread_mutex_unlock(&conn->call_mutex) < 0)
-    return -1;
+  }
   return read_id;
 }
 
@@ -190,7 +260,6 @@ int rpc_read_end(conn_t *conn) {
 int rpc_wait_for_response(conn_t *conn) {
   int write_id = rpc_write_end(conn);
   if (write_id < 0 || rpc_read_start(conn, write_id) < 0) {
-    pthread_mutex_unlock(&conn->call_mutex);
     return -1;
   }
   return 0;
@@ -222,7 +291,7 @@ int rpc_write_start_request(conn_t *conn, const int op) {
     return -1;
   }
 
-  if (rpc_write_queue_reset(conn, 2) < 0) { // skip 2 for the header
+  if (rpc_write_queue_reset(conn, 3) < 0) {
     pthread_mutex_unlock(&conn->write_mutex);
     pthread_mutex_unlock(&conn->call_mutex);
     return -1;
@@ -230,6 +299,7 @@ int rpc_write_start_request(conn_t *conn, const int op) {
   conn->request_id = conn->request_id + 2; // leave the last bit the same
   conn->write_id = conn->request_id;
   conn->write_op = op;
+  conn->write_lane_id = rpc_thread_lane_id(conn);
   return 0;
 }
 // rpc_write_start_request starts a new request builder on the given connection
@@ -250,12 +320,13 @@ int rpc_write_start_response(conn_t *conn, const int read_id) {
     return -1;
   }
 
-  if (rpc_write_queue_reset(conn, 1) < 0) { // skip 1 for the header
+  if (rpc_write_queue_reset(conn, 3) < 0) {
     pthread_mutex_unlock(&conn->write_mutex);
     return -1;
   }
   conn->write_id = read_id;
   conn->write_op = -1;
+  conn->write_lane_id = conn->read_lane_id;
   return 0;
 }
 
@@ -592,25 +663,26 @@ int rpc_write_framed(conn_t *conn, const void *data, const size_t size) {
 // the request lock is released after the request is sent and the function
 // returns the request id which can be used to wait for a response.
 int rpc_write_end(conn_t *conn) {
+  bool request = conn->write_op != -1;
   if (conn->closed) {
     pthread_mutex_unlock(&conn->write_mutex);
-    return -1;
-  }
-  if (conn->write_queue_count <= 0) {
-    pthread_mutex_unlock(&conn->write_mutex);
-    return -1;
-  }
-  conn->write_queue[0] = {{&conn->write_id, sizeof(int)}, 0};
-  if (conn->write_op != -1) {
-    if (conn->write_queue_count <= 1) {
-      pthread_mutex_unlock(&conn->write_mutex);
-      return -1;
+    if (request) {
+      pthread_mutex_unlock(&conn->call_mutex);
     }
-    conn->write_queue[1] = {{&conn->write_op, sizeof(unsigned int)}, 0};
+    return -1;
   }
   int write_id = conn->write_id;
-  int result =
-      rpc_http2_writev(conn, conn->write_queue, conn->write_queue_count);
+  int result = -1;
+  if (conn->write_queue_count >= 3) {
+    conn->write_queue[0] = {{&conn->write_id, sizeof(conn->write_id)}, 0};
+    conn->write_queue[1] = {
+        {&conn->write_lane_id, sizeof(conn->write_lane_id)}, 0};
+    conn->write_queue[2] = {{&conn->write_op, sizeof(conn->write_op)}, 0};
+    result = rpc_http2_writev(conn, conn->write_queue, conn->write_queue_count);
+  }
   pthread_mutex_unlock(&conn->write_mutex);
+  if (request) {
+    pthread_mutex_unlock(&conn->call_mutex);
+  }
   return result == 0 ? write_id : -1;
 }

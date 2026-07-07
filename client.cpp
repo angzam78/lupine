@@ -29,6 +29,7 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/uio.h>
+#include <thread>
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
@@ -56,6 +57,27 @@ pthread_mutex_t conn_mutex;
 conn_t conns[16];
 int nconns = 0;
 static bool lupine_rpc_shutting_down = false;
+
+void rpc_destroy_thread_lane(uint64_t lane_id) {
+  conn_t *active_conns[sizeof(conns) / sizeof(conns[0])];
+  int count = 0;
+
+  if (pthread_mutex_lock(&conn_mutex) != 0) {
+    return;
+  }
+  if (!lupine_rpc_shutting_down) {
+    for (int i = 0; i < nconns; ++i) {
+      if (!conns[i].closed) {
+        active_conns[count++] = &conns[i];
+      }
+    }
+  }
+  pthread_mutex_unlock(&conn_mutex);
+
+  for (int i = 0; i < count; ++i) {
+    rpc_write_lane_termination(active_conns[i], lane_id);
+  }
+}
 
 const char *DEFAULT_PORT = "14833";
 
@@ -5679,11 +5701,9 @@ cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY,
       rpc_write(conn, &total_size, sizeof(total_size)) < 0 ||
       rpc_write(conn, packed.data(), packed.size()) < 0 ||
       rpc_write_end(conn) < 0) {
-    pthread_mutex_unlock(&conn->call_mutex);
     return CUDA_ERROR_DEVICE_UNAVAILABLE;
   }
   (void)return_value;
-  pthread_mutex_unlock(&conn->call_mutex);
   return CUDA_SUCCESS;
 }
 
@@ -5843,16 +5863,6 @@ lupine_cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags_safe(
       numBlocks, func, blockSize, dynamicSMemSize, flags);
 }
 
-static int lupine_read_end_host_copy_chunk(conn_t *conn) {
-  int read_id = conn->read_id;
-  conn->read_id = 0;
-  if (pthread_cond_broadcast(&conn->read_cond) < 0 ||
-      pthread_mutex_unlock(&conn->read_mutex) < 0) {
-    return -1;
-  }
-  return read_id;
-}
-
 extern "C" CUresult cuMemcpyDtoH_v2(void *dstHost, CUdeviceptr srcDevice,
                                     size_t ByteCount) {
   lupine_route route = lupine_route_for_deviceptr(srcDevice);
@@ -5872,7 +5882,6 @@ extern "C" CUresult cuMemcpyDtoH_v2(void *dstHost, CUdeviceptr srcDevice,
   }
   int request_id = rpc_write_end(conn);
   if (request_id < 0 || rpc_read_start(conn, request_id) < 0) {
-    pthread_mutex_unlock(&conn->call_mutex);
     return CUDA_ERROR_DEVICE_UNAVAILABLE;
   }
 
@@ -5890,9 +5899,7 @@ extern "C" CUresult cuMemcpyDtoH_v2(void *dstHost, CUdeviceptr srcDevice,
     }
     bool final_chunk =
         return_value != CUDA_SUCCESS || offset + chunk == ByteCount;
-    int read_result = final_chunk ? rpc_read_end(conn)
-                                  : lupine_read_end_host_copy_chunk(conn);
-    if (read_result < 0) {
+    if (rpc_read_end(conn) < 0) {
       return CUDA_ERROR_DEVICE_UNAVAILABLE;
     }
     if (return_value != CUDA_SUCCESS) {
@@ -5900,7 +5907,6 @@ extern "C" CUresult cuMemcpyDtoH_v2(void *dstHost, CUdeviceptr srcDevice,
     }
     offset += chunk;
     if (!final_chunk && rpc_read_start(conn, request_id) < 0) {
-      pthread_mutex_unlock(&conn->call_mutex);
       return CUDA_ERROR_DEVICE_UNAVAILABLE;
     }
   } while (offset < ByteCount);
@@ -5936,7 +5942,6 @@ extern "C" CUresult cuMemcpyAtoH_v2(void *dstHost, CUarray srcArray,
   }
   int request_id = rpc_write_end(conn);
   if (request_id < 0 || rpc_read_start(conn, request_id) < 0) {
-    pthread_mutex_unlock(&conn->call_mutex);
     return CUDA_ERROR_DEVICE_UNAVAILABLE;
   }
 
@@ -5954,9 +5959,7 @@ extern "C" CUresult cuMemcpyAtoH_v2(void *dstHost, CUarray srcArray,
     }
     bool final_chunk =
         return_value != CUDA_SUCCESS || offset + chunk == ByteCount;
-    int read_result = final_chunk ? rpc_read_end(conn)
-                                  : lupine_read_end_host_copy_chunk(conn);
-    if (read_result < 0) {
+    if (rpc_read_end(conn) < 0) {
       return CUDA_ERROR_DEVICE_UNAVAILABLE;
     }
     if (return_value != CUDA_SUCCESS) {
@@ -5964,7 +5967,6 @@ extern "C" CUresult cuMemcpyAtoH_v2(void *dstHost, CUarray srcArray,
     }
     offset += chunk;
     if (!final_chunk && rpc_read_start(conn, request_id) < 0) {
-      pthread_mutex_unlock(&conn->call_mutex);
       return CUDA_ERROR_DEVICE_UNAVAILABLE;
     }
   } while (offset < ByteCount);

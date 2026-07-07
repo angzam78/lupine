@@ -19,13 +19,20 @@ struct rpc_write_entry {
   unsigned char framed;
 };
 
-typedef struct {
+#define LUPINE_RPC_TERMINATE_LANE 0xFFFF
+
+typedef struct conn_t conn_t;
+
+struct conn_t {
   lupine_socket_t connfd;
 
   int request_id;
   int read_id;
+  int read_op;
+  uint64_t read_lane_id;
   int write_id;
   int write_op;
+  uint64_t write_lane_id;
 
   pthread_t read_thread;
   pthread_t rpc_thread;
@@ -41,7 +48,7 @@ typedef struct {
   int logical_index;
   int closed;
   void *http2;
-} conn_t;
+};
 
 extern int rpc_dispatch(conn_t *conn, int parity);
 extern int rpc_read_start(conn_t *conn, int write_id);
@@ -56,6 +63,7 @@ extern int rpc_write_start_response(conn_t *conn, const int read_id);
 extern int rpc_write(conn_t *conn, const void *data, const size_t size);
 extern int rpc_write_framed(conn_t *conn, const void *data, const size_t size);
 extern int rpc_write_end(conn_t *conn);
+extern int rpc_write_lane_termination(conn_t *conn, uint64_t lane_id);
 extern void rpc_write_queue_free(conn_t *conn);
 
 extern int rpc_write_kernel_param_values(conn_t *conn, uint32_t count,
