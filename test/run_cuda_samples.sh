@@ -135,16 +135,18 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   exit 0
 fi
 
-if [[ ! -x "$LUPINE_LIB" ]]; then
-  echo "missing shim: $LUPINE_LIB" >&2
-  exit 1
-fi
+if [[ "$BUILD_ONLY" != "1" ]]; then
+  if [[ ! -x "$LUPINE_LIB" ]]; then
+    echo "missing shim: $LUPINE_LIB" >&2
+    exit 1
+  fi
 
-runtime_exports="$(nm -D --defined-only "$LUPINE_LIB" | awk '{print $3}' | grep -E '^cuda' || true)"
-if [[ -n "$runtime_exports" ]]; then
-  echo "shim exports CUDA Runtime API symbols; keep this driver-only:" >&2
-  echo "$runtime_exports" >&2
-  exit 1
+  runtime_exports="$(nm -D --defined-only "$LUPINE_LIB" | awk '{print $3}' | grep -E '^cuda' || true)"
+  if [[ -n "$runtime_exports" ]]; then
+    echo "shim exports CUDA Runtime API symbols; keep this driver-only:" >&2
+    echo "$runtime_exports" >&2
+    exit 1
+  fi
 fi
 
 mkdir -p "$(dirname "$CUDA_SAMPLES_DIR")" "$RESULTS_DIR"
@@ -703,24 +705,29 @@ run_sample() {
 }
 
 result_files=()
-running=0
+pids=()
+
+wait_for_batch() {
+  local pid=""
+
+  for pid in "${pids[@]}"; do
+    wait "$pid" || true
+  done
+  pids=()
+}
 
 for i in "${!samples[@]}"; do
   result_file="$RESULTS_DIR/.sample-$i.tsv"
   result_files[$i]="$result_file"
   run_sample "$i" "$result_file" &
-  running=$((running + 1))
+  pids+=("$!")
 
-  if (( running >= CUDA_SAMPLE_JOBS )); then
-    wait -n || true
-    running=$((running - 1))
+  if (( ${#pids[@]} >= CUDA_SAMPLE_JOBS )); then
+    wait_for_batch
   fi
 done
 
-while (( running > 0 )); do
-  wait -n || true
-  running=$((running - 1))
-done
+wait_for_batch
 
 for i in "${!samples[@]}"; do
   result_file="${result_files[$i]}"
