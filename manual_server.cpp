@@ -3439,7 +3439,9 @@ int handle_manual_cuStreamSynchronize(conn_t *conn) {
       resources == nullptr
           ? 0
           : static_cast<uint32_t>(resources->dtoh_copies.size());
-  auto pending = lupine_detach_pending_dtoh_copies(conn, stream, false);
+  bool all_pending_streams = stream == nullptr;
+  auto pending =
+      lupine_detach_pending_dtoh_copies(conn, stream, all_pending_streams);
   uint32_t pending_copy_count = static_cast<uint32_t>(pending.size());
   copy_count = graph_copy_count + pending_copy_count;
   uint64_t stdout_size = 0;
