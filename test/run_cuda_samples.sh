@@ -91,6 +91,7 @@ LIBRARY_SAMPLES=(
   NV12toBGRandResize
   randomFog
   jitLto
+  histEqualizationNPP
   watershedSegmentationNPP
   boxFilterNPP
   cannyEdgeDetectorNPP
