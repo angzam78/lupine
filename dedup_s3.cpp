@@ -20,21 +20,16 @@
 #include <cstring>
 #include <cstdlib>
 #include <condition_variable>
+#include <curl/curl.h>
 #include <deque>
 #include <lz4.h>
 #include <map>
 #include <mutex>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <nghttp2/nghttp2.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/sha.h>
-#include <openssl/ssl.h>
-#include <poll.h>
 #include <sstream>
 #include <string>
-#include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -175,599 +170,164 @@ std::string uri_encode(const std::string &s, bool encode_slash) {
 }
 
 // ---------------------------------------------------------------------------
-// HTTP/2 client via nghttp2 (replaces the hand-rolled HTTP/1.1 client)
+// HTTP transport via libcurl
 //
-// One persistent TLS+HTTP/2 connection per child process, reused across all
-// S3 requests. nghttp2 handles framing, flow control, HPACK header
-// compression, and response parsing — replacing the hand-rolled HTTP/1.1
-// parser that had four bugs (duplicate Host, HEAD body, chunked encoding,
-// connection lifecycle).
+// libcurl handles HTTP/1.1 and HTTP/2 transparently (ALPN negotiation),
+// connection reuse (keep-alive), chunked transfer encoding, TLS, and
+// response parsing. This replaces both the hand-rolled HTTP/1.1 client
+// and the nghttp2 HTTP/2 client — ~450 lines of transport code replaced
+// with ~120 lines of curl_easy calls.
 //
-// The session is synchronous: each s3_h2_request() submits one HTTP/2
-// stream, drives the send/recv loop until the response is complete, and
-// returns. Multiplexed parallel requests are possible but not yet used —
-// the write-through thread processes the queue serially.
+// Each worker thread gets its own thread-local CURL* handle with a
+// persistent connection, enabling parallel S3 uploads without multiplexing
+// complexity.
 // ---------------------------------------------------------------------------
-
-// Forward declarations for nghttp2 callbacks (used by s3_h2_session::connect)
-static ssize_t s3_send_cb(nghttp2_session *session, const uint8_t *data,
-                           size_t length, int flags, void *user_data);
-static int s3_on_header_cb(nghttp2_session *session, const nghttp2_frame *frame,
-                            const uint8_t *name, size_t namelen,
-                            const uint8_t *value, size_t valuelen,
-                            uint8_t flags, void *user_data);
-static int s3_on_data_chunk_recv_cb(nghttp2_session *session, uint8_t flags,
-                                      int32_t stream_id, const uint8_t *data,
-                                      size_t len, void *user_data);
-static int s3_on_stream_close_cb(nghttp2_session *session, int32_t stream_id,
-                                  uint32_t error_code, void *user_data);
 
 struct s3_response {
   int status = 0;
   std::map<std::string, std::string> headers;
   std::vector<unsigned char> body;
-  bool complete = false;
 };
 
-struct s3_h2_session {
-  nghttp2_session *session = nullptr;
-  SSL *ssl = nullptr;
-  SSL_CTX *ssl_ctx = nullptr;
-  int sockfd = -1;
-  std::string host;
-  int port = 443;
-  bool use_tls = true;
-  bool use_http1 = false;  // true if server doesn't support HTTP/2
+// libcurl write callback: appends data to the response body
+static size_t s3_curl_write_cb(char *ptr, size_t size, size_t nmemb,
+                                void *userdata) {
+  auto *resp = static_cast<s3_response *>(userdata);
+  size_t total = size * nmemb;
+  resp->body.insert(resp->body.end(), ptr, ptr + total);
+  return total;
+}
 
-  ~s3_h2_session() { close_conn(); }
+// libcurl header callback: captures status code and headers
+static size_t s3_curl_header_cb(char *buffer, size_t size, size_t nitems,
+                                 void *userdata) {
+  auto *resp = static_cast<s3_response *>(userdata);
+  size_t total = size * nitems;
+  std::string line(buffer, total);
+  // Remove trailing \r\n
+  while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
+    line.pop_back();
 
-  void close_conn() {
-    if (session) { nghttp2_session_del(session); session = nullptr; }
-    if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); ssl = nullptr; }
-    if (ssl_ctx) { SSL_CTX_free(ssl_ctx); ssl_ctx = nullptr; }
-    if (sockfd >= 0) { close(sockfd); sockfd = -1; }
-  }
-
-  bool connect(const std::string &h, int p, bool tls) {
-    host = h;
-    port = p;
-    use_tls = tls;
-
-    struct addrinfo hints = {}, *res = nullptr;
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    std::string port_str = std::to_string(port);
-    if (getaddrinfo(host.c_str(), port_str.c_str(), &hints, &res) != 0 || !res)
-      return false;
-    sockfd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (sockfd < 0) { freeaddrinfo(res); return false; }
-    if (::connect(sockfd, res->ai_addr, res->ai_addrlen) < 0) {
-      close(sockfd); sockfd = -1; freeaddrinfo(res); return false;
+  // Status line: "HTTP/1.1 200 OK" or "HTTP/2 200"
+  if (line.substr(0, 5) == "HTTP/") {
+    auto sp = line.find(' ');
+    if (sp != std::string::npos) {
+      auto sp2 = line.find(' ', sp + 1);
+      std::string code = (sp2 == std::string::npos)
+          ? line.substr(sp + 1) : line.substr(sp + 1, sp2 - sp - 1);
+      resp->status = std::atoi(code.c_str());
     }
-    freeaddrinfo(res);
-
-    // 30s timeout so S3 hangs don't block forever.
-    struct timeval tv;
-    tv.tv_sec = 30;
-    tv.tv_usec = 0;
-    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-
-    if (use_tls) {
-      ssl_ctx = SSL_CTX_new(TLS_client_method());
-      if (!ssl_ctx) return false;
-      SSL_CTX_set_default_verify_paths(ssl_ctx);
-      // Offer both h2 and http/1.1 via ALPN. Some S3-compatible servers
-      // (e.g., B2) only support HTTP/1.1 — we fall back gracefully.
-      static const unsigned char alpn_protos[] = {
-        2, 'h', '2',              // HTTP/2
-        8, 'h', 't', 't', 'p', '/', '1', '.', '1'  // HTTP/1.1
-      };
-      SSL_CTX_set_alpn_protos(ssl_ctx, alpn_protos, sizeof(alpn_protos));
-      ssl = SSL_new(ssl_ctx);
-      if (!ssl) return false;
-      SSL_set_tlsext_host_name(ssl, host.c_str());
-      SSL_set_fd(ssl, sockfd);
-      if (SSL_connect(ssl) != 1) return false;
-
-      // Check ALPN result — if the server selected http/1.1, skip nghttp2
-      // and use HTTP/1.1 with keep-alive on the persistent TLS connection.
-      const unsigned char *proto = nullptr;
-      unsigned int proto_len = 0;
-      SSL_get0_alpn_selected(ssl, &proto, &proto_len);
-      if (proto_len != 2 || memcmp(proto, "h2", 2) != 0) {
-        use_http1 = true;
-        return true;  // skip nghttp2 setup — HTTP/1.1 path will be used
-      }
-    }
-
-    // Create nghttp2 client session (only if h2 was negotiated)
-    nghttp2_session_callbacks *callbacks = nullptr;
-    if (nghttp2_session_callbacks_new(&callbacks) != 0) return false;
-    nghttp2_session_callbacks_set_send_callback(callbacks, s3_send_cb);
-    nghttp2_session_callbacks_set_on_header_callback(callbacks, s3_on_header_cb);
-    nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks,
-        s3_on_data_chunk_recv_cb);
-    nghttp2_session_callbacks_set_on_stream_close_callback(callbacks,
-        s3_on_stream_close_cb);
-
-    int rv = nghttp2_session_client_new(&session, callbacks, this);
-    nghttp2_session_callbacks_del(callbacks);
-    if (rv != 0) return false;
-
-    // Submit initial SETTINGS
-    nghttp2_settings_entry settings[] = {
-      {NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, 0x7fffffff},
-      {NGHTTP2_SETTINGS_MAX_FRAME_SIZE, 0x7fffffff},
-    };
-    nghttp2_submit_settings(session, NGHTTP2_FLAG_NONE, settings, 2);
-    nghttp2_session_set_local_window_size(session, NGHTTP2_FLAG_NONE, 0,
-                                          0x7fffffff);
-
-    return true;
+    return total;
   }
 
-  bool is_alive() const {
-    // HTTP/1.1 mode: session is nullptr but ssl/sockfd are valid
-    // HTTP/2 mode: session is non-null
-    return sockfd >= 0 && (session != nullptr || use_http1);
-  }
-};
-
-// Thread-local persistent session — each thread gets its own HTTP/2 connection.
-// The write-through thread pool uses one connection per worker, enabling
-// parallel S3 uploads without multiplexing complexity.
-static thread_local s3_h2_session *tls_h2_session = nullptr;
-
-// Get or create the thread-local persistent session.
-static s3_h2_session *get_h2_session(const s3_config &cfg) {
-  if (tls_h2_session && tls_h2_session->is_alive()) return tls_h2_session;
-
-  delete tls_h2_session;
-  tls_h2_session = new s3_h2_session;
-
-  std::string host = cfg.endpoint;
-  int port = cfg.use_tls ? 443 : 80;
-  auto colon = host.find(':');
+  // Regular header
+  auto colon = line.find(':');
   if (colon != std::string::npos) {
-    port = std::atoi(host.c_str() + colon + 1);
-    host = host.substr(0, colon);
+    std::string key = line.substr(0, colon);
+    std::string val = line.substr(colon + 1);
+    while (!val.empty() && val[0] == ' ') val = val.substr(1);
+    std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+    resp->headers[key] = val;
   }
-
-  if (!tls_h2_session->connect(host, port, cfg.use_tls)) {
-    delete tls_h2_session;
-    tls_h2_session = nullptr;
-    return nullptr;
-  }
-  return tls_h2_session;
+  return total;
 }
 
-// Force reconnect (called on error)
-static void reset_h2_session() {
-  delete tls_h2_session;
-  tls_h2_session = nullptr;
+// Thread-local CURL handle — each worker thread gets its own persistent
+// connection. libcurl reuses the connection across requests (keep-alive
+// for HTTP/1.1, multiplexing for HTTP/2).
+static thread_local CURL *tls_curl = nullptr;
+
+static CURL *get_curl_handle() {
+  if (tls_curl) return tls_curl;
+  tls_curl = curl_easy_init();
+  if (tls_curl) {
+    // Enable HTTP/2 if available (negotiated via ALPN)
+    curl_easy_setopt(tls_curl, CURLOPT_HTTP_VERSION,
+                     CURL_HTTP_VERSION_2_0);
+    // 30s timeout
+    curl_easy_setopt(tls_curl, CURLOPT_TIMEOUT, 30L);
+    curl_easy_setopt(tls_curl, CURLOPT_CONNECTTIMEOUT, 10L);
+    // Verify TLS
+    curl_easy_setopt(tls_curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(tls_curl, CURLOPT_SSL_VERIFYHOST, 2L);
+    // Set callbacks
+    curl_easy_setopt(tls_curl, CURLOPT_WRITEFUNCTION, s3_curl_write_cb);
+    curl_easy_setopt(tls_curl, CURLOPT_HEADERFUNCTION, s3_curl_header_cb);
+  }
+  return tls_curl;
 }
 
-// --- nghttp2 callbacks ---
-
-static ssize_t s3_send_cb(nghttp2_session *session, const uint8_t *data,
-                           size_t length, int flags, void *user_data) {
-  s3_h2_session *sess = static_cast<s3_h2_session *>(user_data);
-  int n;
-  if (sess->ssl) {
-    n = SSL_write(sess->ssl, data, static_cast<int>(length));
-    if (n <= 0) {
-      int err = SSL_get_error(sess->ssl, n);
-      if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
-        return NGHTTP2_ERR_WOULDBLOCK;
-      return NGHTTP2_ERR_CALLBACK_FAILURE;
-    }
-  } else {
-    n = ::send(sess->sockfd, data, length, 0);
-    if (n < 0) {
-      if (errno == EAGAIN || errno == EWOULDBLOCK)
-        return NGHTTP2_ERR_WOULDBLOCK;
-      return NGHTTP2_ERR_CALLBACK_FAILURE;
-    }
-  }
-  return n;
+// Build the full URL for an S3 request
+static std::string s3_build_url(const s3_config &cfg,
+                                 const std::string &host,
+                                 const std::string &http_path) {
+  std::string scheme = cfg.use_tls ? "https" : "http";
+  return scheme + "://" + host + http_path;
 }
 
-static int s3_on_header_cb(nghttp2_session *session, const nghttp2_frame *frame,
-                            const uint8_t *name, size_t namelen,
-                            const uint8_t *value, size_t valuelen,
-                            uint8_t flags, void *user_data) {
-  s3_response *resp = static_cast<s3_response *>(
-      nghttp2_session_get_stream_user_data(session, frame->hd.stream_id));
-  if (!resp) return 0;
+// Perform a signed S3 request via libcurl. The signed headers from s3_sign
+// are passed as CURL headers. libcurl handles connection reuse, HTTP
+// version negotiation, and response parsing.
+static bool s3_curl_request(const s3_config &cfg,
+                             const std::string &method,
+                             const std::string &host,
+                             const std::string &http_path,
+                             const std::vector<std::pair<std::string, std::string>> &signed_headers,
+                             const void *body, size_t body_size,
+                             s3_response &resp) {
+  CURL *curl = get_curl_handle();
+  if (!curl) return false;
 
-  // :status pseudo-header
-  if (namelen == 7 && memcmp(name, ":status", 7) == 0) {
-    resp->status = std::atoi(std::string((const char *)value, valuelen).c_str());
-    return 0;
-  }
+  // Reset handle for a new request (keeps connection pool)
+  curl_easy_reset(curl);
+  curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0);
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+  curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+  curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, s3_curl_write_cb);
+  curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, s3_curl_header_cb);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
+  curl_easy_setopt(curl, CURLOPT_HEADERDATA, &resp);
+  curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method.c_str());
 
-  // Regular header (lowercase key for case-insensitive lookup)
-  std::string key((const char *)name, namelen);
-  std::string val((const char *)value, valuelen);
-  std::transform(key.begin(), key.end(), key.begin(), ::tolower);
-  resp->headers[key] = val;
-  return 0;
-}
+  // Build URL
+  std::string url = s3_build_url(cfg, host, http_path);
+  curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
 
-static int s3_on_data_chunk_recv_cb(nghttp2_session *session, uint8_t flags,
-                                      int32_t stream_id, const uint8_t *data,
-                                      size_t len, void *user_data) {
-  s3_response *resp = static_cast<s3_response *>(
-      nghttp2_session_get_stream_user_data(session, stream_id));
-  if (!resp) return 0;
-  resp->body.insert(resp->body.end(), data, data + len);
-  return 0;
-}
-
-static int s3_on_stream_close_cb(nghttp2_session *session, int32_t stream_id,
-                                  uint32_t error_code, void *user_data) {
-  s3_response *resp = static_cast<s3_response *>(
-      nghttp2_session_get_stream_user_data(session, stream_id));
-  if (resp) resp->complete = true;
-  return 0;
-}
-
-// Data source for PUT/POST body
-struct s3_body_source {
-  const uint8_t *data;
-  size_t size;
-  size_t offset = 0;
-};
-
-static ssize_t s3_data_read_cb(nghttp2_session *session, int32_t stream_id,
-                                uint8_t *buf, size_t length,
-                                uint32_t *data_flags,
-                                nghttp2_data_source *source, void *user_data) {
-  s3_body_source *src = static_cast<s3_body_source *>(source->ptr);
-  size_t remaining = src->size - src->offset;
-  if (remaining == 0) {
-    *data_flags |= NGHTTP2_DATA_FLAG_EOF;
-    return 0;
-  }
-  size_t to_copy = std::min(length, remaining);
-  memcpy(buf, src->data + src->offset, to_copy);
-  src->offset += to_copy;
-  return static_cast<ssize_t>(to_copy);
-}
-
-// Helper: build nghttp2_nv from string pair (no-copy, borrows the strings)
-static nghttp2_nv make_nv(const std::string &name, const std::string &value) {
-  nghttp2_nv nv;
-  nv.name = const_cast<uint8_t *>(
-      reinterpret_cast<const uint8_t *>(name.c_str()));
-  nv.namelen = name.size();
-  nv.value = const_cast<uint8_t *>(
-      reinterpret_cast<const uint8_t *>(value.c_str()));
-  nv.valuelen = value.size();
-  nv.flags = NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE;
-  return nv;
-}
-
-// HTTP/1.1 request on the persistent TLS connection (keep-alive).
-// Used when the S3 server doesn't support HTTP/2 (e.g., B2).
-// Reuses the session's SSL connection — no new TLS handshake per request.
-static bool s3_http1_request(s3_h2_session *sess,
-                              const std::string &method,
-                              const std::string &authority,
-                              const std::string &path,
-                              const std::vector<std::pair<std::string, std::string>> &headers,
-                              const void *body, size_t body_size,
-                              s3_response &resp) {
-  // Build HTTP/1.1 request
-  std::string req = method + " " + path + " HTTP/1.1\r\n";
-  // Check if Host is already in the signed headers (s3_sign adds it).
-  // Don't add a duplicate — that causes 400 errors.
-  bool has_host = false;
-  for (auto &h : headers) {
-    if (h.first == "host" || h.first == "Host") { has_host = true; break; }
-  }
-  if (!has_host) {
-    req += "Host: " + authority + "\r\n";
-  }
-  for (auto &h : headers) {
-    req += h.first + ": " + h.second + "\r\n";
-  }
-  req += "Content-Length: " + std::to_string(body_size) + "\r\n";
-  req += "Connection: keep-alive\r\n";
-  req += "\r\n";
-
-  // Write request line + headers
-  const char *p = req.data();
-  size_t remaining = req.size();
-  while (remaining > 0) {
-    int n;
-    if (sess->ssl) {
-      n = SSL_write(sess->ssl, p, static_cast<int>(remaining));
-    } else {
-      n = ::send(sess->sockfd, p, remaining, 0);
-    }
-    if (n <= 0) return false;
-    p += n;
-    remaining -= static_cast<size_t>(n);
-  }
-
-  // Write body
-  if (body_size > 0) {
-    p = static_cast<const char *>(body);
-    remaining = body_size;
-    while (remaining > 0) {
-      int n;
-      if (sess->ssl) {
-        n = SSL_write(sess->ssl, p, static_cast<int>(remaining));
-      } else {
-        n = ::send(sess->sockfd, p, remaining, 0);
-      }
-      if (n <= 0) return false;
-      p += n;
-      remaining -= static_cast<size_t>(n);
-    }
-  }
-
-  // Read response — status line
-  auto read_line = [&sess]() -> std::string {
-    std::string line;
-    for (;;) {
-      unsigned char c;
-      int n;
-      if (sess->ssl) {
-        n = SSL_read(sess->ssl, &c, 1);
-      } else {
-        n = ::recv(sess->sockfd, &c, 1, 0);
-      }
-      if (n <= 0) return "";
-      line += static_cast<char>(c);
-      if (line.size() >= 2 && line[line.size()-2] == '\r' && line[line.size()-1] == '\n') {
-        line.resize(line.size()-2);
-        return line;
-      }
-    }
-  };
-
-  std::string status_line = read_line();
-  if (status_line.empty()) return false;
-  {
-    auto sp1 = status_line.find(' ');
-    if (sp1 == std::string::npos) return false;
-    auto sp2 = status_line.find(' ', sp1 + 1);
-    std::string code_str = (sp2 == std::string::npos)
-        ? status_line.substr(sp1 + 1)
-        : status_line.substr(sp1 + 1, sp2 - sp1 - 1);
-    resp.status = std::atoi(code_str.c_str());
-  }
-
-  // Read headers
-  for (;;) {
-    std::string line = read_line();
-    if (line.empty()) break;
-    auto colon = line.find(':');
-    if (colon != std::string::npos) {
-      std::string key = line.substr(0, colon);
-      std::string val = line.substr(colon + 1);
-      while (!val.empty() && val[0] == ' ') val = val.substr(1);
-      std::transform(key.begin(), key.end(), key.begin(), ::tolower);
-      resp.headers[key] = val;
-    }
-  }
-
-  // Read body
-  resp.body.clear();
-  resp.complete = true;
-  if (method == "HEAD") return true;  // no body for HEAD
-
-  // Check for chunked transfer encoding
-  auto te_it = resp.headers.find("transfer-encoding");
-  bool chunked = false;
-  if (te_it != resp.headers.end()) {
-    std::string te = te_it->second;
-    std::transform(te.begin(), te.end(), te.begin(), ::tolower);
-    chunked = (te.find("chunked") != std::string::npos);
-  }
-
-  if (chunked) {
-    // Parse chunked transfer encoding
-    for (;;) {
-      std::string size_line = read_line();
-      if (size_line.empty()) return false;
-      // Parse hex chunk size (ignore chunk extensions after ';')
-      size_t semi = size_line.find(';');
-      if (semi != std::string::npos) size_line = size_line.substr(0, semi);
-      size_t chunk_size = std::stoul(size_line, nullptr, 16);
-      if (chunk_size == 0) {
-        // Read trailing headers (empty line ends the response)
-        for (;;) {
-          std::string trailing = read_line();
-          if (trailing.empty()) break;
-        }
-        break;
-      }
-      size_t off = resp.body.size();
-      resp.body.resize(off + chunk_size);
-      char *bp = reinterpret_cast<char *>(resp.body.data()) + off;
-      size_t to_read = chunk_size;
-      while (to_read > 0) {
-        int n;
-        if (sess->ssl) {
-          n = SSL_read(sess->ssl, bp, static_cast<int>(to_read));
-        } else {
-          n = ::recv(sess->sockfd, bp, to_read, 0);
-        }
-        if (n <= 0) return false;
-        bp += n;
-        to_read -= static_cast<size_t>(n);
-      }
-      // Read trailing \r\n after each chunk
-      read_line();
-    }
-    return true;
-  }
-
-  auto cl_it = resp.headers.find("content-length");
-  if (cl_it != resp.headers.end()) {
-    size_t cl = std::stoul(cl_it->second);
-    resp.body.resize(cl);
-    char *bp = reinterpret_cast<char *>(resp.body.data());
-    size_t to_read = cl;
-    while (to_read > 0) {
-      int n;
-      if (sess->ssl) {
-        n = SSL_read(sess->ssl, bp, static_cast<int>(std::min(to_read, static_cast<size_t>(16384))));
-      } else {
-        n = ::recv(sess->sockfd, bp, to_read, 0);
-      }
-      if (n <= 0) return false;
-      bp += n;
-      to_read -= static_cast<size_t>(n);
-    }
-  } else {
-    // Read until connection close or EOF
-    char buf[8192];
-    for (;;) {
-      int n;
-      if (sess->ssl) {
-        n = SSL_read(sess->ssl, buf, sizeof(buf));
-      } else {
-        n = ::recv(sess->sockfd, buf, sizeof(buf), 0);
-      }
-      if (n <= 0) break;
-      resp.body.insert(resp.body.end(), buf, buf + n);
-    }
-  }
-  return true;
-}
-
-// Synchronous HTTP/2 request: submit, drive I/O loop, return response.
-// The session is reused across calls (persistent TLS+H2 connection).
-static bool s3_h2_request(const s3_config &cfg,
-                           const std::string &method,
-                           const std::string &host,
-                           const std::string &path,  // includes query string
-                           const std::vector<std::pair<std::string, std::string>> &signed_headers,
-                           const void *body, size_t body_size,
-                           s3_response &resp) {
-  s3_h2_session *sess = get_h2_session(cfg);
-  if (!sess) return false;
-
-  // If the server doesn't support HTTP/2, use HTTP/1.1 with keep-alive
-  // on the persistent TLS connection.
-  if (sess->use_http1) {
-    return s3_http1_request(sess, method, host, path,
-                             signed_headers, body, body_size, resp);
-  }
-
-  // Build HTTP/2 pseudo-headers + signed headers
-  std::vector<nghttp2_nv> nvs;
-  nvs.push_back(make_nv(":method", method));
-  nvs.push_back(make_nv(":scheme", cfg.use_tls ? "https" : "http"));
-  nvs.push_back(make_nv(":authority", host));
-  nvs.push_back(make_nv(":path", path));
+  // Build headers list from signed headers
+  struct curl_slist *hdrs = nullptr;
   for (auto &h : signed_headers) {
-    nvs.push_back(make_nv(h.first, h.second));
+    std::string hdr = h.first + ": " + h.second;
+    hdrs = curl_slist_append(hdrs, hdr.c_str());
+  }
+  // Content-Length is needed for PUT/POST with body
+  if (body_size > 0) {
+    std::string cl = "Content-Length: " + std::to_string(body_size);
+    hdrs = curl_slist_append(hdrs, cl.c_str());
+  }
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+
+  // Set body for PUT/POST
+  if (body && body_size > 0) {
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body_size);
   }
 
-  // Set up body data source for PUT/POST
-  s3_body_source src;
-  nghttp2_data_provider data_prd;
-  if (body && body_size > 0) {
-    src.data = static_cast<const uint8_t *>(body);
-    src.size = body_size;
-    src.offset = 0;
-    data_prd.source.ptr = &src;
-    data_prd.read_callback = s3_data_read_cb;
-  }
+  // Perform the request
+  CURLcode rv = curl_easy_perform(curl);
+  curl_slist_free_all(hdrs);
 
-  // Submit the request (creates a new HTTP/2 stream)
-  int32_t stream_id;
-  if (body && body_size > 0) {
-    stream_id = nghttp2_submit_request(sess->session, nullptr,
-                                        nvs.data(), nvs.size(),
-                                        &data_prd, &resp);
-  } else {
-    stream_id = nghttp2_submit_request(sess->session, nullptr,
-                                        nvs.data(), nvs.size(),
-                                        nullptr, &resp);
-  }
-  if (stream_id < 0) {
-    LUPINE_LOG_ERROR("nghttp2_submit_request failed: " +
-                     std::string(nghttp2_strerror(stream_id)));
+  if (rv != CURLE_OK) {
+    LUPINE_LOG_ERROR("curl_easy_perform failed: " +
+                     std::string(curl_easy_strerror(rv)));
     return false;
   }
 
-  // Drive the I/O loop until the response is complete.
-  // nghttp2_session_send flushes outbound frames (request headers + body).
-  // SSL_read + nghttp2_session_mem_recv processes inbound frames (response).
-  // The loop naturally handles HTTP/2 flow control: if the send is paused
-  // (server window full), we read a WINDOW_UPDATE, then send more.
-  int error_count = 0;
-  while (!resp.complete) {
-    // Flush outbound
-    int rv = nghttp2_session_send(sess->session);
-    if (rv != 0) {
-      LUPINE_LOG_ERROR("nghttp2_session_send failed: " +
-                       std::string(nghttp2_strerror(rv)));
-      break;
-    }
+  // If we didn't get a status code, something went wrong
+  if (resp.status == 0) return false;
 
-    // Read inbound
-    unsigned char buf[65536];
-    int n;
-    if (sess->ssl) {
-      n = SSL_read(sess->ssl, buf, sizeof(buf));
-    } else {
-      n = ::recv(sess->sockfd, buf, sizeof(buf), 0);
-    }
-
-    if (n > 0) {
-      ssize_t processed = nghttp2_session_mem_recv(sess->session, buf,
-                                                    static_cast<size_t>(n));
-      if (processed < 0) {
-        LUPINE_LOG_ERROR("nghttp2_session_mem_recv failed: " +
-                         std::string(nghttp2_strerror(static_cast<int>(processed))));
-        break;
-      }
-      error_count = 0;
-    } else if (n == 0) {
-      // Connection closed by server
-      reset_h2_session();
-      break;
-    } else {
-      // n < 0 — error or would block
-      int err;
-      if (sess->ssl) {
-        err = SSL_get_error(sess->ssl, n);
-        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-          // Need to wait for data. Use poll to avoid busy-looping.
-          struct pollfd pfd;
-          pfd.fd = sess->sockfd;
-          pfd.events = (err == SSL_ERROR_WANT_WRITE) ? POLLOUT : POLLIN;
-          pfd.revents = 0;
-          poll(&pfd, 1, 30000);  // 30s timeout
-          continue;
-        }
-      } else {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-          struct pollfd pfd;
-          pfd.fd = sess->sockfd;
-          pfd.events = POLLIN;
-          pfd.revents = 0;
-          poll(&pfd, 1, 30000);
-          continue;
-        }
-      }
-      if (++error_count > 3) {
-        LUPINE_LOG_ERROR("S3 read error, giving up");
-        reset_h2_session();
-        break;
-      }
-    }
-  }
-
-  return resp.complete;
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -930,7 +490,7 @@ bool s3_do_request(const s3_config &cfg, const std::string &method,
     authority = authority.substr(0, colon);
   }
 
-  return s3_h2_request(cfg, method, authority, http_path,
+  return s3_curl_request(cfg, method, authority, http_path,
                         sr.headers, body, body_size, resp);
 }
 
@@ -996,7 +556,7 @@ bool s3_delete_objects(const s3_config &cfg,
   if (colon != std::string::npos) authority = authority.substr(0, colon);
 
   s3_response resp;
-  return s3_h2_request(cfg, "POST", authority, http_path,
+  return s3_curl_request(cfg, "POST", authority, http_path,
                         sr.headers, xml.data(), xml.size(), resp) &&
          resp.status >= 200 && resp.status < 300;
 }
@@ -1040,7 +600,7 @@ bool s3_list_objects(const s3_config &cfg, const std::string &continuation,
   if (colon != std::string::npos) authority = authority.substr(0, colon);
 
   s3_response resp;
-  if (!s3_h2_request(cfg, "GET", authority, http_path,
+  if (!s3_curl_request(cfg, "GET", authority, http_path,
                       sr.headers, nullptr, 0, resp)) return false;
   if (resp.status != 200) return false;
 

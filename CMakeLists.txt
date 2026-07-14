@@ -15,7 +15,10 @@ find_library(NGHTTP2_LIBRARY nghttp2 REQUIRED)
 # but the dedup S3 L2 client needs OpenSSL for TLS to S3-compatible storage
 # and for SigV4 signing (SHA-256, HMAC-SHA256). The client also needs OpenSSL
 # for https:// connections to Lupine servers. So we link OpenSSL on all targets.
+# libcurl is used by the S3 L2 client for HTTP transport (handles both HTTP/1.1
+# and HTTP/2 transparently via ALPN negotiation).
 find_package(OpenSSL QUIET)
+find_package(CURL REQUIRED)
 
 if (NOT CUDAToolkit_VERSION)
     message(FATAL_ERROR "CUDA Toolkit is required but not found.")
@@ -133,7 +136,7 @@ if (NOT WIN32)
       target_compile_definitions(${CLIENT_OUTPUT} PRIVATE LUPINE_TLS_OPENSSL)
       target_link_libraries(${CLIENT_OUTPUT} PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     endif()
-    target_link_libraries(${CLIENT_OUTPUT} PRIVATE stdc++ ${NGHTTP2_LIBRARY} lupine_lz4 lupine_xxhash)
+    target_link_libraries(${CLIENT_OUTPUT} PRIVATE stdc++ ${NGHTTP2_LIBRARY} lupine_lz4 lupine_xxhash CURL::libcurl)
     target_link_options(${CLIENT_OUTPUT} PRIVATE
         "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/client.exports"
     )
@@ -150,7 +153,7 @@ if (NOT WIN32)
       target_compile_definitions(${NVML_CLIENT_OUTPUT} PRIVATE LUPINE_TLS_OPENSSL)
       target_link_libraries(${NVML_CLIENT_OUTPUT} PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     endif()
-    target_link_libraries(${NVML_CLIENT_OUTPUT} PRIVATE stdc++ ${NGHTTP2_LIBRARY} lupine_lz4 lupine_xxhash)
+    target_link_libraries(${NVML_CLIENT_OUTPUT} PRIVATE stdc++ ${NGHTTP2_LIBRARY} lupine_lz4 lupine_xxhash CURL::libcurl)
     target_link_options(${NVML_CLIENT_OUTPUT} PRIVATE
         "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/nvml.exports"
     )
@@ -165,7 +168,7 @@ endif()
 add_executable(${SERVER_OUTPUT} ${SERVER_SOURCES} ${SERVER_HEADERS})
 target_include_directories(${SERVER_OUTPUT} PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
 target_compile_definitions(${SERVER_OUTPUT} PRIVATE LUPINE_RPC_SERVER)
-target_link_libraries(${SERVER_OUTPUT} PRIVATE CUDA::cuda_driver ${NGHTTP2_LIBRARY} lupine_lz4 lupine_xxhash)
+target_link_libraries(${SERVER_OUTPUT} PRIVATE CUDA::cuda_driver ${NGHTTP2_LIBRARY} lupine_lz4 lupine_xxhash CURL::libcurl)
 if(OpenSSL_FOUND)
     target_compile_definitions(${SERVER_OUTPUT} PRIVATE LUPINE_TLS_OPENSSL)
     target_link_libraries(${SERVER_OUTPUT} PRIVATE OpenSSL::SSL OpenSSL::Crypto)
@@ -184,7 +187,7 @@ else()
         ${CMAKE_CURRENT_SOURCE_DIR}/dedup_s3.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/h2_test.cpp
     )
-    target_link_libraries(h2_test PRIVATE stdc++ ${NGHTTP2_LIBRARY} lupine_lz4 lupine_xxhash pthread)
+    target_link_libraries(h2_test PRIVATE stdc++ ${NGHTTP2_LIBRARY} lupine_lz4 lupine_xxhash CURL::libcurl pthread)
     if(OpenSSL_FOUND)
         target_compile_definitions(h2_test PRIVATE LUPINE_TLS_OPENSSL)
         target_link_libraries(h2_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
