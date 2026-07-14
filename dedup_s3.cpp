@@ -422,10 +422,11 @@ signed_request s3_sign(
   std::string amz_date = datetime_str;
   std::string date_stamp = date_str;
 
-  // Build canonical headers (must be sorted by key, lowercase)
+  // Build canonical headers (must be sorted by key, lowercase).
+  // Note: x-amz-content-sha256 is sent as a header but NOT included in
+  // the signed headers, matching boto3's behavior for B2 compatibility.
   std::map<std::string, std::string> hdrs;
   hdrs["host"] = host;
-  hdrs["x-amz-content-sha256"] = payload_hash;
   hdrs["x-amz-date"] = amz_date;
 
   std::string canonical_headers;
@@ -486,6 +487,9 @@ signed_request s3_sign(
   for (auto &h : hdrs) {
     sr.headers.push_back({h.first, h.second});
   }
+  // x-amz-content-sha256 is sent as a header (B2 requires it) but not
+  // included in the signed headers, matching boto3's behavior.
+  sr.headers.push_back({"x-amz-content-sha256", payload_hash});
   sr.headers.push_back({"authorization", auth});
   sr.headers.push_back({"Content-Length", std::to_string(body_size)});
   return sr;
