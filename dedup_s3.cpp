@@ -924,63 +924,185 @@ write_queue &get_write_queue() {
 // HTTP/2 connection, so N workers = N concurrent S3 PUTs.
 constexpr int S3_WRITE_WORKER_COUNT = 8;
 
+// Number of concurrent transfers per worker via curl_multi.
+// Each worker can have this many S3 PUTs in flight simultaneously,
+// hiding per-request latency behind data transfer.
+constexpr int CONCURRENT_PUTS_PER_WORKER = 4;
+
+// Per-transfer state for curl_multi
+struct multi_transfer {
+  CURL *easy = nullptr;
+  write_queue_entry entry;
+  s3_response resp;
+  std::string url;
+  struct curl_slist *hdrs = nullptr;
+  // Keep body data alive until transfer completes
+  std::vector<unsigned char> body_copy;
+};
+
 void write_through_worker() {
+  const s3_config &cfg = get_s3_config();
+  CURLM *multi = curl_multi_init();
+  curl_multi_setopt(multi, CURLMOPT_MAXCONNECTS,
+                    CONCURRENT_PUTS_PER_WORKER);
+
+  std::vector<std::unique_ptr<multi_transfer>> active;
+
   for (;;) {
-    write_queue_entry entry;
-    {
-      std::unique_lock<std::mutex> lock(get_write_queue().mutex);
-      get_write_queue().cv.wait(lock, [] {
-        return get_write_queue().shutdown || !get_write_queue().entries.empty();
-      });
-      if (get_write_queue().shutdown && get_write_queue().entries.empty()) break;
-      if (get_write_queue().entries.empty()) continue;
-      entry = std::move(get_write_queue().entries.front());
-      get_write_queue().entries.pop_front();
-    }
-
-    const s3_config &cfg = get_s3_config();
-    std::string key = hash_to_s3_key(entry.hash);
-    if (!s3_put_object(cfg, key, entry.data.data(), entry.data.size())) {
-      LUPINE_LOG_ERROR("S3 PUT failed for chunk");
-      continue;
-    }
-
-    // Update manifest
-    bool need_manifest_write = false;
-    {
-      s3_manifest &m = get_manifest();
-      std::lock_guard<std::mutex> lock(m.mutex);
-      auto now = std::chrono::system_clock::now();
-      manifest_entry me;
-      me.hash = entry.hash;
-      me.timestamp = static_cast<uint64_t>(
-          std::chrono::duration_cast<std::chrono::seconds>(
-              now.time_since_epoch()).count());
-      me.size = entry.data.size();
-
-      // Check if already in manifest
-      bool found = false;
-      for (auto &e : m.entries) {
-        if (e.hash == me.hash) { found = true; break; }
-      }
-      if (!found) {
-        m.entries.push_back(me);
-        m.new_additions.push_back(me.hash);
-        m.dirty = true;
+    // Fill up to CONCURRENT_PUTS_PER_WORKER active transfers
+    while (active.size() < static_cast<size_t>(CONCURRENT_PUTS_PER_WORKER)) {
+      write_queue_entry entry;
+      {
+        std::unique_lock<std::mutex> lock(get_write_queue().mutex);
+        get_write_queue().cv.wait(lock, [] {
+          return get_write_queue().shutdown || !get_write_queue().entries.empty();
+        });
+        if (get_write_queue().shutdown && get_write_queue().entries.empty()) {
+          // No more entries — break out of fill loop
+          break;
+        }
+        if (get_write_queue().entries.empty()) continue;
+        entry = std::move(get_write_queue().entries.front());
+        get_write_queue().entries.pop_front();
       }
 
-      // Write manifest every 20 PUTs (shared counter across all workers)
-      int count = get_write_queue().put_counter.fetch_add(1) + 1;
-      if (count % 20 == 0) {
-        need_manifest_write = true;
+      // Build and submit the PUT
+      auto mt = std::make_unique<multi_transfer>();
+      mt->entry = std::move(entry);
+      mt->easy = curl_easy_init();
+      if (!mt->easy) continue;
+
+      std::string host, path;
+      s3_build_host_path(cfg, hash_to_s3_key(mt->entry.hash), host, path);
+      mt->url = s3_build_url(cfg, host, path);
+
+      // SigV4 sign
+      char hash_hex[65];
+      sha256_hex(mt->entry.data.data(), mt->entry.data.size(), hash_hex);
+      signed_request sr = s3_sign("PUT", host, path, "", hash_hex,
+                                   mt->entry.data.data(),
+                                   mt->entry.data.size(), cfg);
+      std::string authority = host;
+      auto colon = authority.find(':');
+      if (colon != std::string::npos) authority = authority.substr(0, colon);
+
+      curl_easy_setopt(mt->easy, CURLOPT_URL, mt->url.c_str());
+      curl_easy_setopt(mt->easy, CURLOPT_HTTP_VERSION,
+                       CURL_HTTP_VERSION_2_0);
+      curl_easy_setopt(mt->easy, CURLOPT_TIMEOUT, 30L);
+      curl_easy_setopt(mt->easy, CURLOPT_CONNECTTIMEOUT, 10L);
+      curl_easy_setopt(mt->easy, CURLOPT_SSL_VERIFYPEER, 1L);
+      curl_easy_setopt(mt->easy, CURLOPT_SSL_VERIFYHOST, 2L);
+      curl_easy_setopt(mt->easy, CURLOPT_CUSTOMREQUEST, "PUT");
+      curl_easy_setopt(mt->easy, CURLOPT_WRITEFUNCTION, s3_curl_write_cb);
+      curl_easy_setopt(mt->easy, CURLOPT_HEADERFUNCTION, s3_curl_header_cb);
+      curl_easy_setopt(mt->easy, CURLOPT_WRITEDATA, &mt->resp);
+      curl_easy_setopt(mt->easy, CURLOPT_HEADERDATA, &mt->resp);
+
+      // Headers
+      mt->hdrs = nullptr;
+      for (auto &h : sr.headers) {
+        std::string hdr = h.first + ": " + h.second;
+        mt->hdrs = curl_slist_append(mt->hdrs, hdr.c_str());
+      }
+      std::string cl = "Content-Length: " +
+                       std::to_string(mt->entry.data.size());
+      mt->hdrs = curl_slist_append(mt->hdrs, cl.c_str());
+      curl_easy_setopt(mt->easy, CURLOPT_HTTPHEADER, mt->hdrs);
+
+      // Body — copy to keep it alive
+      mt->body_copy = mt->entry.data;
+      curl_easy_setopt(mt->easy, CURLOPT_POSTFIELDS, mt->body_copy.data());
+      curl_easy_setopt(mt->easy, CURLOPT_POSTFIELDSIZE,
+                       (long)mt->body_copy.size());
+
+      curl_multi_add_handle(multi, mt->easy);
+      active.push_back(std::move(mt));
+    }
+
+    if (active.empty() && get_write_queue().shutdown) break;
+    if (active.empty()) continue;
+
+    // Drive the multi handle
+    int still_running = 0;
+    curl_multi_perform(multi, &still_running);
+
+    // Poll for completions
+    int msgs_left = 0;
+    CURLMsg *msg;
+    std::vector<size_t> completed_indices;
+    while ((msg = curl_multi_info_read(multi, &msgs_left)) != nullptr) {
+      if (msg->msg == CURLMSG_DONE) {
+        CURL *easy = msg->easy_handle;
+        // Find the matching transfer
+        for (size_t i = 0; i < active.size(); i++) {
+          if (active[i]->easy == easy) {
+            CURLcode rv = msg->data.result;
+            if (rv == CURLE_OK && active[i]->resp.status >= 200 &&
+                active[i]->resp.status < 300) {
+              // Success — update manifest
+              bool need_manifest_write = false;
+              {
+                s3_manifest &m = get_manifest();
+                std::lock_guard<std::mutex> lock(m.mutex);
+                auto now = std::chrono::system_clock::now();
+                manifest_entry me;
+                me.hash = active[i]->entry.hash;
+                me.timestamp = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::seconds>(
+                        now.time_since_epoch()).count());
+                me.size = active[i]->body_copy.size();
+
+                bool found = false;
+                for (auto &e : m.entries) {
+                  if (e.hash == me.hash) { found = true; break; }
+                }
+                if (!found) {
+                  m.entries.push_back(me);
+                  m.new_additions.push_back(me.hash);
+                  m.dirty = true;
+                }
+
+                int count = get_write_queue().put_counter.fetch_add(1) + 1;
+                if (count % 20 == 0) {
+                  need_manifest_write = true;
+                }
+              }
+              if (need_manifest_write) {
+                write_manifest_to_s3();
+              }
+            } else {
+              LUPINE_LOG_ERROR("S3 PUT failed");
+            }
+            curl_multi_remove_handle(multi, easy);
+            curl_easy_cleanup(easy);
+            if (active[i]->hdrs) curl_slist_free_all(active[i]->hdrs);
+            completed_indices.push_back(i);
+            break;
+          }
+        }
       }
     }
-    // Write manifest outside the lock to avoid deadlock.
-    // Only one worker will do this (the one that hits the % 20 boundary).
-    if (need_manifest_write) {
-      write_manifest_to_s3();
+
+    // Remove completed transfers (iterate backwards to keep indices valid)
+    for (auto it = completed_indices.rbegin(); it != completed_indices.rend(); ++it) {
+      active.erase(active.begin() + *it);
+    }
+
+    // Wait for activity if transfers are still running
+    if (!active.empty()) {
+      int numfds = 0;
+      curl_multi_wait(multi, nullptr, 0, 1000, &numfds);
     }
   }
+
+  // Cleanup any remaining transfers
+  for (auto &mt : active) {
+    curl_multi_remove_handle(multi, mt->easy);
+    curl_easy_cleanup(mt->easy);
+    if (mt->hdrs) curl_slist_free_all(mt->hdrs);
+  }
+  curl_multi_cleanup(multi);
 }
 
 // Periodic manifest flush (every 5s if dirty).
