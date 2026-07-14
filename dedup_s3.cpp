@@ -289,7 +289,14 @@ static bool s3_curl_request(const s3_config &cfg,
   curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, s3_curl_header_cb);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
   curl_easy_setopt(curl, CURLOPT_HEADERDATA, &resp);
-  curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method.c_str());
+  // Set HTTP method
+  if (method == "HEAD") {
+    curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, nullptr);
+  } else {
+    curl_easy_setopt(curl, CURLOPT_NOBODY, 0L);
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method.c_str());
+  }
 
   // Build URL
   std::string url = s3_build_url(cfg, host, http_path);
