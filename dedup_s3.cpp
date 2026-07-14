@@ -548,6 +548,53 @@ static bool s3_http1_request(s3_h2_session *sess,
   resp.complete = true;
   if (method == "HEAD") return true;  // no body for HEAD
 
+  // Check for chunked transfer encoding
+  auto te_it = resp.headers.find("transfer-encoding");
+  bool chunked = false;
+  if (te_it != resp.headers.end()) {
+    std::string te = te_it->second;
+    std::transform(te.begin(), te.end(), te.begin(), ::tolower);
+    chunked = (te.find("chunked") != std::string::npos);
+  }
+
+  if (chunked) {
+    // Parse chunked transfer encoding
+    for (;;) {
+      std::string size_line = read_line();
+      if (size_line.empty()) return false;
+      // Parse hex chunk size (ignore chunk extensions after ';')
+      size_t semi = size_line.find(';');
+      if (semi != std::string::npos) size_line = size_line.substr(0, semi);
+      size_t chunk_size = std::stoul(size_line, nullptr, 16);
+      if (chunk_size == 0) {
+        // Read trailing headers (empty line ends the response)
+        for (;;) {
+          std::string trailing = read_line();
+          if (trailing.empty()) break;
+        }
+        break;
+      }
+      size_t off = resp.body.size();
+      resp.body.resize(off + chunk_size);
+      char *bp = reinterpret_cast<char *>(resp.body.data()) + off;
+      size_t to_read = chunk_size;
+      while (to_read > 0) {
+        int n;
+        if (sess->ssl) {
+          n = SSL_read(sess->ssl, bp, static_cast<int>(to_read));
+        } else {
+          n = ::recv(sess->sockfd, bp, to_read, 0);
+        }
+        if (n <= 0) return false;
+        bp += n;
+        to_read -= static_cast<size_t>(n);
+      }
+      // Read trailing \r\n after each chunk
+      read_line();
+    }
+    return true;
+  }
+
   auto cl_it = resp.headers.find("content-length");
   if (cl_it != resp.headers.end()) {
     size_t cl = std::stoul(cl_it->second);
