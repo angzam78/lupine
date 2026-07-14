@@ -864,6 +864,37 @@ void load_manifest_from_s3() {
   m.loaded = true;
   LUPINE_LOG_DEBUG("S3 manifest loaded: " + std::to_string(m.entries.size()) +
                    " entries, version " + std::to_string(m.version));
+
+  // If the manifest has 0 entries, the bucket might still have objects
+  // (e.g., a previous server was killed before writing the manifest).
+  // Fall back to scanning the bucket.
+  if (m.entries.empty()) {
+    LUPINE_LOG_DEBUG("S3 manifest is empty, scanning bucket...");
+    std::string continuation;
+    bool truncated = true;
+    while (truncated) {
+      std::vector<s3_list_entry> entries;
+      std::string next_token;
+      if (!s3_list_objects(cfg, continuation, entries, truncated, next_token)) {
+        LUPINE_LOG_ERROR("S3 list_objects failed during manifest rebuild");
+        break;
+      }
+      for (auto &e : entries) {
+        lupine_dedup_hash128 h;
+        if (s3_key_to_hash(e.key, &h)) {
+          manifest_entry me;
+          me.hash = h;
+          me.size = e.size;
+          me.timestamp = 0;
+          m.entries.push_back(me);
+        }
+      }
+      continuation = next_token;
+    }
+    m.dirty = true;
+    LUPINE_LOG_DEBUG("S3 manifest rebuilt from bucket scan: " +
+                     std::to_string(m.entries.size()) + " entries");
+  }
 }
 
 void write_manifest_to_s3() {
