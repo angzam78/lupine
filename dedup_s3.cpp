@@ -507,7 +507,12 @@ bool s3_do_request(const s3_config &cfg, const std::string &method,
                    http_response &resp) {
   std::string host, path;
   s3_build_host_path(cfg, key, host, path);
-  if (!query.empty()) path += "?" + query;
+
+  // For SigV4, the canonical URI is just the path (without query string).
+  // The query string goes in the canonical query string separately.
+  // The HTTP request line includes both: "GET /path?query HTTP/1.1"
+  std::string http_path = path;
+  if (!query.empty()) http_path += "?" + query;
 
   // Payload hash
   char hash_hex[65];
@@ -518,6 +523,7 @@ bool s3_do_request(const s3_config &cfg, const std::string &method,
                 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", 65);
   }
 
+  // s3_sign takes: method, host, canonical_path (no query), canonical_query, ...
   signed_request sr = s3_sign(method, host, path, query, hash_hex,
                                body, body_size, cfg);
 
@@ -533,7 +539,8 @@ bool s3_do_request(const s3_config &cfg, const std::string &method,
   if (!client.connect(host, port, cfg.use_tls)) {
     return false;
   }
-  return client.send_request(method, host, path, sr.headers, body, body_size, resp);
+  // Send the HTTP request with the full path (including query string)
+  return client.send_request(method, host, http_path, sr.headers, body, body_size, resp);
 }
 
 // PUT: upload a chunk to S3.
@@ -576,20 +583,18 @@ bool s3_delete_objects(const s3_config &cfg,
   std::string host, path;
   if (cfg.path_style) {
     host = cfg.endpoint;
-    path = "/" + uri_encode(cfg.bucket, true) + "?delete=";
+    path = "/" + uri_encode(cfg.bucket, true);
   } else {
     host = cfg.bucket + "." + cfg.endpoint;
-    path = "/?delete=";
+    path = "/";
   }
+  std::string query = "delete=";
+  std::string http_path = path + "?" + query;
 
   char hash_hex[65];
   sha256_hex(xml.data(), xml.size(), hash_hex);
 
-  // Add Content-MD5 header? S3 requires it for DeleteObjects. We'll compute
-  // it. Actually, B2 and most S3-compatible APIs don't strictly require it.
-  // Let's skip it for simplicity and add it if needed.
-
-  signed_request sr = s3_sign("POST", host, path, "delete=",
+  signed_request sr = s3_sign("POST", host, path, query,
                                hash_hex, xml.data(), xml.size(), cfg);
   sr.headers.push_back({"Content-Type", "application/xml"});
 
@@ -603,7 +608,7 @@ bool s3_delete_objects(const s3_config &cfg,
   http_client client;
   if (!client.connect(host, port, cfg.use_tls)) return false;
   http_response resp;
-  if (!client.send_request("POST", host, path, sr.headers,
+  if (!client.send_request("POST", host, http_path, sr.headers,
                             xml.data(), xml.size(), resp)) return false;
   return resp.status >= 200 && resp.status < 300;
 }
@@ -627,15 +632,18 @@ bool s3_list_objects(const s3_config &cfg, const std::string &continuation,
   std::string host, path;
   if (cfg.path_style) {
     host = cfg.endpoint;
-    path = "/" + uri_encode(cfg.bucket, true) + "?" + query;
+    path = "/" + uri_encode(cfg.bucket, true);
   } else {
     host = cfg.bucket + "." + cfg.endpoint;
-    path = "/?" + query;
+    path = "/";
   }
+  // HTTP request path includes the query string
+  std::string http_path = path + "?" + query;
 
   char hash_hex[65];
   std::memcpy(hash_hex,
               "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", 65);
+  // s3_sign takes canonical_path (no query) and canonical_query separately
   signed_request sr = s3_sign("GET", host, path, query, hash_hex,
                                nullptr, 0, cfg);
 
@@ -649,7 +657,7 @@ bool s3_list_objects(const s3_config &cfg, const std::string &continuation,
   http_client client;
   if (!client.connect(host, port, cfg.use_tls)) return false;
   http_response resp;
-  if (!client.send_request("GET", host, path, sr.headers,
+  if (!client.send_request("GET", host, http_path, sr.headers,
                             nullptr, 0, resp)) return false;
   if (resp.status != 200) return false;
 
