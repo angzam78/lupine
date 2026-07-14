@@ -292,7 +292,15 @@ struct http_client {
                     const void *body, size_t body_size,
                     http_response &resp) {
     std::string req = method + " " + path + " HTTP/1.1\r\n";
-    req += "Host: " + host + "\r\n";
+    // Check if Host is already in the signed headers (s3_sign adds it).
+    // If so, don't add it again — duplicate Host headers cause 400 errors.
+    bool has_host = false;
+    for (auto &h : headers) {
+      if (h.first == "host" || h.first == "Host") { has_host = true; break; }
+    }
+    if (!has_host) {
+      req += "Host: " + host + "\r\n";
+    }
     for (auto &h : headers) {
       req += h.first + ": " + h.second + "\r\n";
     }
