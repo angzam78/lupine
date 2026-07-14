@@ -1,24 +1,30 @@
 # Lupine Dedup Architecture
 
 **Status:** Living document. Updated when the implementation changes.
-**Last updated:** 2026-07-14 (corrected sharing model)
-**Implementation:** `dedup.h`, `dedup.cpp` (server disk cache + client mirror + payload hooks)
-**Wire format:** Extensions to the LZ4 block framing in `compress.cpp`
-**Default:** OFF. Set `LUPINE_DEDUP=1` on both client and server to enable.
+**Last updated:** 2026-07-15 (S3 L2 cache + additions channel)
+**Implementation:** `dedup.h`, `dedup.cpp` (L1 disk cache + client mirror + payload hooks + additions channel), `dedup_s3.h`, `dedup_s3.cpp` (S3 L2 cache)
+**Wire format:** Extensions to the LZ4 block framing in `compress.cpp` and the response prefix in `rpc.cpp`
+**Default:** OFF. Set `LUPINE_DEDUP=1` on both client and server to enable. S3 L2 is optional — set `LUPINE_DEDUP_S3_BUCKET` to enable.
 
 ---
 
 ## 1. Overview
 
-Lupine's client shim re-sends every byte of every `cuMemcpyHtoD*` call to the server, even when the same bytes were sent seconds ago — by the same client or by a different client. The dedup feature adds a **shared, content-addressed chunk cache** that replaces repeated chunk transfers with a 20-byte hash reference.
+Lupine's client shim re-sends every byte of every `cuMemcpyHtoD*` call to the server, even when the same bytes were sent seconds ago — by the same client or by a different client. The dedup feature adds a **two-tier, content-addressed chunk cache** that replaces repeated chunk transfers with a 20-byte hash reference.
+
+**Two-tier cache:**
+- **L1: local disk** (`dedup.cpp`). Chunks stored as files in `~/.cache/lupine-dedup/chunks/`. Microsecond lookups via OS page cache. Bounded by `LUPINE_DEDUP_CACHE_BYTES` (default 4 GiB). Shared across all forked server children. Persists across restarts.
+- **L2: S3-compatible object storage** (`dedup_s3.cpp`, optional). Chunks stored as objects in B2/R2/AWS S3/MinIO. Async write-through from L1. On L1 miss, the server fetches from S3 and promotes to L1. Survives L1 disk loss, server migration, and enables cross-server cache sharing. Gated on `LUPINE_DEDUP_S3_BUCKET`.
+
+**Additions channel:**
+- The server pushes new cache entries (L1 inserts + S3 promotions) to clients via a bit-31 flag in the response prefix (see §3.3). This keeps client mirrors current as the server cache changes, without requiring clients to poll.
 
 **Sharing model (this is the key thing to understand):**
 
-- The **server-side disk cache is shared across all connections and all forked server children**. All children of a server process point at the same `LUPINE_DEDUP_CACHE_DIR` (default `~/.cache/lupine-dedup`). Chunk X uploaded by client A is a HIT for client B on a different connection, because both connections' `disk_cache_impl` instances read and write the same on-disk chunk files. This is a major benefit for multi-tenant serving: two clients loading the same model share the cache.
-- The **client-side mirror is per client process** (one `lupine_dedup_client_cache` per client connection). Each client only knows about hashes it has either (a) sent as a MISS, or (b) received from the server's hash-list handshake on connect (the `lupineDedupHashList` RPC, see §9.1). A client does NOT automatically know about chunks other clients cached — but it doesn't need to, because the client only needs to answer "would *my* last send of this hash have been a HIT?".
-- The **per-connection state on the server** is just invalidation bookkeeping: `pending_invalidations` (the buffer of evictions to forward to THIS connection's client on the next response), `send_buffer`/`send_count` (the snapshot sent on the next response), and `invalidation_log_offset` (this child's read cursor into the shared `invalidations.log`). Each child has its own `disk_cache_impl` C++ instance for this; the actual chunk data lives on disk and is shared.
-
-So "per-connection" applies to: the `disk_cache_impl` instance, the invalidation stream, and the client mirror. It does **not** apply to the chunks themselves — those are globally shared on disk.
+- The **L1 disk cache is shared across all connections and all forked server children**. All children of a server process point at the same `LUPINE_DEDUP_CACHE_DIR` (default `~/.cache/lupine-dedup`). Chunk X uploaded by client A is a HIT for client B on a different connection, because both connections' `disk_cache_impl` instances read and write the same on-disk chunk files. This is a major benefit for multi-tenant serving: two clients loading the same model share the cache.
+- The **L2 S3 cache is shared across all servers** pointing at the same bucket. A chunk cached by server A is available to server B's L2 lookup. This enables cross-region, cross-server cache sharing without inter-server RPC.
+- The **client-side mirror is per client process** (one `lupine_dedup_client_cache` per client connection). Each client only knows about hashes it has either (a) sent as a MISS, or (b) received from the server's hash-list handshake on connect (the `lupineDedupHashList` RPC, see §9.1), or (c) received via the additions channel (§3.3). A client does NOT automatically know about chunks other clients cached — but the additions channel notifies it within one RPC round-trip of the server caching a new chunk.
+- The **per-connection state on the server** is invalidation + addition bookkeeping: `pending_invalidations` (evictions to forward), `pending_additions` (new cache entries to forward), `send_buffer`/`send_count` (the snapshot sent on the next response), and `invalidation_log_offset` / `additions_log_offset` (this child's read cursor into the shared logs). Each child has its own `disk_cache_impl` C++ instance for this; the actual chunk data lives on disk (L1) and/or S3 (L2) and is shared.
 
 **Scope (v1):** `cuMemcpyHtoD_v2` and `cuMemcpyHtoDAsync_v2` — the client→server host-to-device copy paths. These are the only paths currently marked `COMPRESSIBLE` in `codegen/annotations.h`, so they're the only ones that go through `rpc_write_payload` / `rpc_read_payload_part` (where dedup hooks in).
 
@@ -79,21 +85,34 @@ When the token is `LUPINE_DEDUP_REF_TOKEN`, the next 16 bytes are a `lupine_dedu
 | MISS, LZ4 doesn't shrink | 4 MiB + 4 | `[u32 0] [raw 4 MiB]` (same as non-dedup) |
 | Below dedup threshold (< 64 KiB) | unchanged | Plain `rpc_write`, neither dedup nor LZ4 |
 
-### 3.3 Invalidation prefix on responses
+### 3.3 Response prefix: invalidations + additions
 
-Every response from a dedup-enabled server carries an invalidation prefix **before** the normal response payload:
+Every response from a dedup-enabled server carries a prefix **before** the normal response payload. The prefix carries two channels: **invalidations** (hashes evicted from the server cache) and **additions** (hashes newly added to the server cache).
 
+**Format without additions (common case):**
 ```
-[u32 count] [count × 16-byte hashes]
+[u32 inv_count] [inv_count × 16-byte hashes]
 ```
 
-- `count == 0` — common case, no evictions since the last response (4 bytes overhead)
-- `count > 0` — `count` hashes that the server has evicted; the client removes them from its mirror
-- `count == 0xFFFFFFFF` — "clear-all" marker. The client already handles this (`lupine_dedup_client_clear`); the server-side trigger (e.g. admin sentinel file) is future work.
+**Format with additions (bit 31 set):**
+```
+[u32 inv_count | 0x80000000] [inv_count × 16-byte hashes] [u32 add_count] [add_count × 16-byte hashes]
+```
 
-The client reads this prefix in `rpc_read_start` (via `lupine_dedup_read_invalidations`) **before** reading any response-specific data. This keeps the client mirror in sync with the server cache state as of the previous response.
+- `inv_count == 0` — no evictions (4 bytes overhead, common case)
+- `inv_count > 0` (bit 31 clear) — `inv_count` hashes that the server has evicted; the client removes them from its mirror
+- `inv_count` with bit 31 set — invalidations followed by additions (see below)
+- `inv_count == 0xFFFFFFFF` — "clear-all" marker (all bits set, checked before bit-31 test). The client clears its entire mirror. The server-side trigger is future work.
+
+**Additions channel (bit 31):** When the server has new cache entries to report (from L1 inserts by other forks, or from S3 promotions), it sets bit 31 of `inv_count` and appends `[u32 add_count][add_count × 16-byte hashes]` after the invalidations. The client calls `lupine_dedup_client_add` for each addition hash. Already-present hashes are no-ops (the mirror is a set). `add_count` is capped at 4096 per response to bound the prefix size; remaining additions are sent on subsequent responses.
+
+**Why bit 31?** Real `inv_count` values never exceed 256M (the sanity bound). Bit 31 is always available as a signal flag. This avoids adding a second count word to every response — the 99% case (no additions) is still 4 bytes, same as before.
 
 **Wire format symmetry:** Only the server side (which has `dedup_server_cache`) writes the prefix. Only the client side (which has `dedup_client_cache`) reads it. The `rpc_write_start_response` and `rpc_read_start` hooks gate on these fields, so non-dedup connections and non-server writes skip the prefix entirely.
+
+The client reads this prefix in `rpc_read_start` (via `lupine_dedup_read_invalidations`) **before** reading any response-specific data. This keeps the client mirror in sync with the server cache state (both evictions and additions) as of the previous response.
+
+**Important:** The `inv_count` word (with bit 31) is stored as a member of `disk_cache_impl` (`inv_count_word`), not as a local variable. This is because `rpc_write` stores *pointers* to caller data, not copies — a local variable would be a use-after-free when `rpc_write_end` sends the data after the function has returned.
 
 ### 3.4 No negotiation in v1
 
@@ -113,24 +132,31 @@ The server cache is **disk-backed**. Chunks are stored as individual files in a 
 ├── chunks/
 │   └── ab/cdef0123456789...           # 4 MiB file per chunk, sharded by hash prefix
 ├── size                                # uint64: current total bytes (fcntl-locked)
-└── invalidations.log                   # append-only, 16 bytes per eviction
+├── invalidations.log                   # append-only, 16 bytes per eviction
+└── additions.log                       # append-only, 16 bytes per insert
 ```
 
 **Per-connection state** (in `disk_cache_impl`, one instance per forked server child):
 ```c
 struct disk_cache_impl {
     std::string cache_dir;
-    size_t byte_cap = 0;                        // default 4 GiB
-    std::mutex mutex;                           // protects pending_invalidations, send_buffer
+    size_t byte_cap = 0;
+    std::mutex mutex;  // protects pending_*, send_*, additions_*
     std::vector<lupine_dedup_hash128> pending_invalidations;
-    std::vector<lupine_dedup_hash128> send_buffer;   // snapshot for next response
+    std::vector<lupine_dedup_hash128> pending_additions;
+    std::vector<lupine_dedup_hash128> send_buffer;
+    std::vector<lupine_dedup_hash128> additions_send_buffer;
     uint32_t send_count = 0;
-    int invalidation_log_fd = -1;               // for reading evictions by other forks
-    off_t invalidation_log_offset = 0;          // last read position
+    uint32_t additions_send_count = 0;
+    uint32_t inv_count_word = 0;  // stored here so rpc_write pointer is valid
+    int invalidation_log_fd = -1;
+    off_t invalidation_log_offset = 0;
+    int additions_log_fd = -1;
+    off_t additions_log_offset = 0;
 };
 ```
 
-`cache_dir` and `byte_cap` are the same across all instances (read from env at instance creation), so they're effectively per-process constants rather than per-connection state. The genuinely per-connection fields are `pending_invalidations`, `send_buffer`/`send_count`, `invalidation_log_fd`, and `invalidation_log_offset` — these track what THIS connection's client needs to hear about on the next response. Each forked child has its own `disk_cache_impl` because each child serves a different client with a different mirror, but all instances point at the same on-disk cache directory.
+`cache_dir` and `byte_cap` are the same across all instances (read from env at instance creation), so they're effectively per-process constants rather than per-connection state. The genuinely per-connection fields are `pending_invalidations`, `pending_additions`, `send_buffer`/`send_count`, `additions_send_buffer`/`additions_send_count`, `inv_count_word`, `invalidation_log_fd`, `invalidation_log_offset`, `additions_log_fd`, and `additions_log_offset` — these track what THIS connection's client needs to hear about on the next response. Each forked child has its own `disk_cache_impl` because each child serves a different client with a different mirror, but all instances point at the same on-disk cache directory.
 
 There is **no in-process `bytes` counter** on `disk_cache_impl`. The current total cache size lives in the on-disk `size` file and is read freshly on every update via `update_size_file()` (which takes a `fcntl(F_SETLKW)` lock, preads the current value, applies the delta, and writes it back). This is what makes the size tracking correct across forked children that share the cache directory.
 
@@ -138,6 +164,7 @@ There is **no in-process `bytes` counter** on `disk_cache_impl`. The current tot
 - `chunks/` — one file per chunk, named by hex-encoded hash, sharded into 256 subdirectories by the first 2 hex chars
 - `size` — 8-byte file containing the current total cache size in bytes, protected by `fcntl(F_SETLKW)` for cross-process safety
 - `invalidations.log` — append-only log of evicted hashes (16 bytes each), drained by each child on every response
+- `additions.log` — append-only log of newly-inserted hashes (16 bytes each), drained by each child on every response. Same structure as `invalidations.log` but for the additions channel (§3.3).
 
 **Eviction policy:** FIFO by file mtime. When a new insert pushes the total over `byte_cap`, the cache is scanned, files are sorted by mtime ascending, and the oldest are `unlink`'d until the total drops to 90% of cap (10% headroom to avoid evicting on every single insert).
 
@@ -152,7 +179,23 @@ struct client_cache_impl {
 };
 ```
 
-Hashes only — no chunk bytes. The client already has the bytes in the caller's buffer; the mirror exists solely to answer "does the server have this chunk?" without a round-trip.
+Hashes only — no chunk bytes. The client already has the bytes in the caller's buffer; the mirror exists solely to answer "does the server have this chunk?" without a round-trip. The mirror reflects the union of L1 and L2 cache state — the client doesn't distinguish which tier a chunk is in, only whether the server has it.
+
+### 4.3 S3 L2 cache (`dedup_s3.cpp`)
+
+When `LUPINE_DEDUP_S3_BUCKET` is set, the server maintains an S3-compatible L2 cache alongside the L1 disk cache. The L2 is **best-effort**: if S3 is unavailable, the server operates as L1-only. A background thread periodically retries the S3 connection and re-enables L2 when it becomes available.
+
+**S3 client implementation:** A minimal HTTP/1.1 + TLS client with AWS SigV4 signing, built directly on OpenSSL. No SDK dependency. Supports PUT, GET, HEAD, DeleteObjects, and ListObjectsV2. Works with any S3-compatible endpoint (B2, R2, AWS S3, MinIO). The signing key derivation uses the standard SigV4 chain: `k_date = HMAC("AWS4"+secret_key, date)`, `k_region = HMAC(k_date, region)`, `k_service = HMAC(k_region, "s3")`, `k_signing = HMAC(k_service, "aws4_request")`.
+
+**Manifest file:** A single S3 object (`manifest.bin`) listing all cached hashes with timestamps and sizes. Format: `[u64 version][u32 count][count × (16-byte hash + 8-byte timestamp + 8-byte size)]`. The manifest is written every 10 S3 PUTs and every 5 seconds (if dirty), so it's current even on ungraceful shutdown. On startup, if the manifest has 0 entries but the bucket has objects (e.g., previous server was killed before manifest flush), the server falls back to scanning the bucket via ListObjectsV2.
+
+**Async write-through:** On every successful L1 insert, the chunk is enqueued for background S3 PUT. The write queue holds up to 512 entries (2 GiB). If the queue is full, entries are dropped (best-effort — the chunk is still in L1). The write thread processes entries serially; each PUT takes ~100-200ms to B2.
+
+**L2 lookup with L1 promotion:** On L1 miss, the server checks S3. On S3 hit, the chunk is fetched, decompressed if needed, written to `dst`, and the caller promotes it to L1 via `lupine_dedup_server_insert` (which gets `EEXIST` since the chunk was just fetched). This means frequently-accessed S3 chunks migrate to L1 automatically.
+
+**Cross-server sharing:** Multiple Lupine servers pointing at the same S3 bucket share the L2 cache. A chunk cached by server A is available to server B's L2 lookup. The manifest is shared, but each server maintains its own in-memory copy (refreshed on startup and updated on writes).
+
+**Cleanup:** `lupine_dedup_s3_cleanup(byte_cap)` deletes oldest S3 objects until total stored size ≤ `byte_cap`. Reads the in-memory manifest (which includes timestamps), sorts by timestamp ascending, batch-deletes the oldest via DeleteObjects (1000 per batch), and rewrites the manifest. Intended to run on server startup and on last-client-disconnect (when the server is idle).
 
 ---
 
@@ -397,14 +440,43 @@ Each child tracks its own read offset (`invalidation_log_offset`) in process mem
 
 ## 10. Configuration
 
+### 10.1 L1 disk cache
+
 | Env var | Default | Purpose |
 |---------|---------|---------|
 | `LUPINE_DEDUP` | unset (off) | Set to `1` on both client and server to enable dedup |
 | `LUPINE_DEDUP_CACHE_DIR` | `~/.cache/lupine-dedup` | Server disk cache directory. Created if it doesn't exist. Persists across restarts. |
-| `LUPINE_DEDUP_CACHE_BYTES` | `4294967296` (4 GiB) | Server cache cap in bytes. Set to at least the model size to avoid eviction churn. |
+| `LUPINE_DEDUP_CACHE_BYTES` | `4294967296` (4 GiB) | L1 cache cap in bytes. Set to at least the model size to avoid eviction churn. |
 | `LUPINE_DEDUP_COMPRESS_CACHE` | `1` (on) | When `1`, chunks are stored LZ4-compressed on disk (halving disk usage). When `0`, raw bytes are stored (faster lookups, more disk). |
 | `LUPINE_TRACE` | unset | Set to `1` (mapped to stderr to keep stdout clean for device printf capture), `2` (stderr), or a file path to see dedup HIT/MISS trace lines. |
 | `LUPINE_LOG_LEVEL` | `debug` | Verbosity for non-trace logs (`none`, `error`, `debug`). |
+
+### 10.2 S3 L2 cache (optional)
+
+All S3 env vars are optional. S3 L2 is enabled when `LUPINE_DEDUP_S3_BUCKET` is set (and `LUPINE_DEDUP=1` is already on). When not set, the server operates as L1-only with zero S3 overhead.
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `LUPINE_DEDUP_S3_BUCKET` | unset | S3 bucket name. Setting this enables the L2 cache. |
+| `LUPINE_DEDUP_S3_ENDPOINT` | (required) | S3 endpoint hostname, e.g. `s3.eu-central-003.backblazeb2.com`. Optional `https://` prefix (default) or `http://` (no TLS). |
+| `LUPINE_DEDUP_S3_REGION` | (required) | S3 region, e.g. `eu-central-003`. |
+| `LUPINE_DEDUP_S3_ACCESS_KEY` | (required) | S3 access key ID. |
+| `LUPINE_DEDUP_S3_SECRET_KEY` | (required) | S3 secret access key. |
+| `LUPINE_DEDUP_S3_PREFIX` | unset | Optional key prefix within the bucket (for multi-tenant bucket sharing). |
+| `LUPINE_DEDUP_S3_PATH_STYLE` | `1` (on) | `1` = path-style URLs (`/bucket/key`, B2/MinIO). `0` = virtual-host-style (`bucket.s3.amazonaws.com/key`, AWS S3). |
+| `LUPINE_DEDUP_S3_CACHE_BYTES` | `0` (unlimited) | L2 cache cap in bytes. When set, `lupine_dedup_s3_cleanup` evicts oldest objects to stay under this cap. |
+
+**Example (B2 with Cloudflare proxy):**
+```bash
+LUPINE_DEDUP=1 \
+LUPINE_DEDUP_S3_ENDPOINT=s3.eu-central-003.backblazeb2.com \
+LUPINE_DEDUP_S3_BUCKET=my-lupine-cache \
+LUPINE_DEDUP_S3_REGION=eu-central-003 \
+LUPINE_DEDUP_S3_ACCESS_KEY=... \
+LUPINE_DEDUP_S3_SECRET_KEY=... \
+LUPINE_DEDUP_S3_PATH_STYLE=1 \
+./build/lupine_driver_server
+```
 
 ---
 
@@ -454,24 +526,26 @@ The PRNG pattern `(i * 1103515245u + 12345u) & 0xFF` is deterministic and reprod
 
 | File | Role | Lines vs upstream |
 |------|------|-------------------|
-| `dedup.h` | Public API: types, constants, function declarations | +219 (new) |
-| `dedup.cpp` | All dedup logic: hash, server cache, client mirror, payload hooks, lifecycle hooks | +932 (new) |
+| `dedup.h` | Public API: types, constants, function declarations | +249 (new) |
+| `dedup.cpp` | L1 disk cache, client mirror, payload hooks, lifecycle hooks, additions channel | +1147 (new) |
+| `dedup_s3.h` | S3 L2 cache public API | +75 (new) |
+| `dedup_s3.cpp` | S3 client (HTTP/TLS/SigV4), manifest, async write-through, L2 lookup, cleanup | +1244 (new) |
 | `compress.cpp` | 3 dispatch hooks (write/read/drain) | +9 |
 | `rpc.cpp` | 3 hooks (conn_destroy, read_start, write_start_response) | +13 |
 | `h2.cpp` | 1 hook (conn_init) | +1 |
 | `rpc.h` | `#include "dedup.h"` + 2 `void *` fields on `conn_t` | +7 |
-| `CMakeLists.txt` | xxHash static lib + `dedup.cpp`/`dedup.h` in source/header lists + link `lupine_xxhash` on all 4 targets | +23 |
+| `CMakeLists.txt` | xxHash static lib, `dedup.cpp`/`dedup_s3.cpp` in sources, link `lupine_xxhash` + OpenSSL on all targets | +30 |
 | `codegen/codegen.py` | Register `lupineDedupHashList` in `PRIVATE_RPC_FUNCTIONS` (survives codegen rerun) | +1 |
 | `codegen/gen_api.h` | `#define LUPINE_RPC_lupineDedupHashList 547002917` (regenerated by codegen.py) | +1 |
 | `client.cpp` | Call `lupine_dedup_client_populate_from_server` after connect | +5 |
-| `manual_server.{cpp,h}` | `handle_manual_lupineDedupHashList` handler + declaration | +30 |
+| `manual_server.{cpp,h}` | `handle_manual_lupineDedupHashList` handler + declaration, includes S3 hashes in handshake | +38 |
 | `server.cpp` | Register handler in `lupine_manual_handlers()` map | +2 |
 | `h2_test.cpp` | 4 new test functions + helper + calls in `main()` | +372 |
 | `third_party/xxhash/{xxhash.h,xxhash.c,LICENSE}` | Vendored xxHash (BSD-2-Clause) for `XXH3_128bits` | +7306 |
 | `docs/dedup-architecture.md` | This document | +new |
-| **Total (excl. vendored xxHash)** | | **~1600 lines** |
+| **Total (excl. vendored xxHash)** | | **~2900 lines** |
 
-Original Lupine files (non-dedup, non-vendored): **~90 lines** of changes across 9 files. All actual logic in 2 new files (`dedup.h`, `dedup.cpp`).
+Original Lupine files (non-dedup, non-vendored): **~100 lines** of changes across 9 files. All actual logic in 4 new files (`dedup.h`, `dedup.cpp`, `dedup_s3.h`, `dedup_s3.cpp`).
 
 ---
 
@@ -483,8 +557,11 @@ Original Lupine files (non-dedup, non-vendored): **~90 lines** of changes across
 4. **Server-side clear-all trigger** — `touch /tmp/lupine-dedup-reset` sentinel file, server sends `count=0xFFFFFFFF` clear-all marker. The client side already handles this via `lupine_dedup_client_clear`; only the server-side trigger is missing.
 5. **Per-call opt-out** — `LUPINE_DEDUP_DISABLE_FOR_NEXT_CALL` flag for one-shot uploads
 6. **Negotiated DtoH dedup** — server→client direction currently has no dedup; same primitive could be applied in reverse
+7. **Parallel S3 uploads** — the async write-through thread currently processes S3 PUTs serially (~100-200ms each). For a 4 GiB model (1024 chunks), this takes 100-200 seconds. Parallel uploads (e.g., 10 concurrent) would reduce this to 10-20 seconds. The write queue already supports it; the write thread just needs to spawn concurrent PUTs.
+8. **S3 cleanup triggers** — `lupine_dedup_s3_cleanup` is implemented but not yet wired into `server.cpp` startup or last-client-disconnect. The function exists; the triggers need to be added.
+9. **L1 eviction race** — when the L1 cache is full and actively evicting, a client may send a DEDUP_REF for a chunk that was just evicted but whose invalidation hasn't been delivered yet. This results in a hard failure (the server can't recover from a DEDUP_REF miss). The `lupine_dedup_server_lookup` fallback to S2 (S3) mitigates this when S3 is enabled — the chunk is fetched from S3 instead of failing. Without S3, the race remains.
 
-(Note: items that were previously listed here but are already implemented — disk-backed storage with page cache §8, cross-fork shared cache §9, xxHash-based hashing — have been removed. The clear-all marker on the client side is also already implemented; only the server-side trigger remains.)
+(Note: items that were previously listed here but are already implemented — disk-backed storage with page cache §8, cross-fork shared cache §9, xxHash-based hashing, streaming handshake, additions channel, S3 L2 cache — have been removed. The clear-all marker on the client side is also already implemented; only the server-side trigger remains.)
 
 ---
 
@@ -502,3 +579,5 @@ Original Lupine files (non-dedup, non-vendored): **~90 lines** of changes across
 | 2026-07-14 | **Document reconciliation**: corrected this document to match the actual implementation — fixed the `disk_cache_impl` snippet (no `impl->bytes` field; size lives in the on-disk `size` file), removed fabricated `server_entry` OOM failure mode, corrected §6.4 failure-mode list, corrected §7.2 lock scope (per-chunk, not whole-payload), added the missing `test_dedup_disk_cache_persistence` test to §11.1, noted that `LUPINE_DEDUP=1` is required to run tests, corrected line counts in §12, removed already-implemented items from §13 future work, noted that the `count=0xFFFFFFFF` clear-all marker is already handled on the client side, replaced the misleading "250× compression" claim with the actually-observed ~164× for PRNG test data, and corrected §11.3's backwards claim about PRNG compressibility. Also fixed code comments in `dedup.cpp` that referenced a "previous fasthash64-based implementation" and "previous std::vector<unsigned char> implementation" that never existed in this codebase — rephrased as design rationale. |
 | 2026-07-14 | **Sharing model correction**: the document previously described the cache as "per-connection", which is misleading — the server-side disk cache is shared across all connections and all forked server children (chunk X uploaded by client A is a HIT for client B), because all `disk_cache_impl` instances point at the same `LUPINE_DEDUP_CACHE_DIR`. Only the `disk_cache_impl` C++ struct, the invalidation stream, and the client mirror are per-connection. Reworded §1, §2.4, §2.5, §4.1, and §9 to reflect this; expanded §9.1 with a concrete cross-client HIT walkthrough and a description of the `lupineDedupHashList` connect-time handshake. Also updated `dedup.h` and `dedup.cpp` header comments to drop the "per-connection" framing. |
 | 2026-07-14 | **Streaming hash-list handshake + drain-on-error fix**: removed the 64K-entry cap on `lupineDedupHashList` responses that prevented the handshake from working with caches larger than ~128 GiB compressed (~256 GiB uncompressed). The client now streams the response in 4096-hash (64 KiB) batches, bounding client RAM to 64 KiB regardless of cache size. The sanity bound is now 256M entries (4 GiB of hashes), existing solely to reject obviously-bogus responses and to keep `count * 16` arithmetic safe from overflow. Added `lupine_dedup_drain_remaining` and called it on every error path after `count` is read (sanity-bound exceeded, or batch read failed mid-stream) — without this drain, the next `rpc_dispatch` read would interpret unread hash bytes as a `request_id` and corrupt the connection. This was a latent connection-corruption bug that only manifested when the cache exceeded 64K chunks; below that threshold the cap silently returned without reading the hashes, leaving them on the wire to be misinterpreted by the next dispatch read. |
+| 2026-07-15 | **S3 L2 cache + additions channel**: added `dedup_s3.cpp`/`dedup_s3.h` implementing an optional S3-compatible L2 cache. Async write-through from L1 to S3 (background thread, 512-entry queue). L2 lookup on L1 miss with L1 promotion. Manifest file in S3 for fast handshake. B2/R2/AWS S3/MinIO compatible via SigV4 signing. Gated on `LUPINE_DEDUP_S3_BUCKET` — zero overhead when disabled. Best-effort: degrades to L1-only if S3 is unavailable, auto-recovers when S3 returns. Added additions channel (bit 31 of `inv_count` in response prefix) so the server pushes new cache entries to clients without polling. Added `additions.log` (mirror of `invalidations.log`) for cross-fork addition notifications. Fixed three bugs found during testing: duplicate Host header in S3 HTTP requests, SigV4 signing key derivation (was using `secret_key + date` instead of `"AWS4" + secret_key`), and HEAD response handling (Content-Length set but no body). Fixed use-after-free in `lupine_dedup_server_flush_invalidations` (inv_count was a local variable, but `rpc_write` stores pointers). Verified end-to-end with Stable Diffusion 1.5 on RTX 5060 Ti: L1 HITs on second run, S2 (S3) HITs after L1 clear + server restart. |
+| 2026-07-15 | **S3 write queue + manifest fixes**: increased write queue from 64 to 512 entries (2 GiB) to avoid dropping chunks during model loads. Write manifest every 10 S3 PUTs (not just every 30s) so it's current on ungraceful shutdown. Reduced periodic manifest flush from 30s to 5s. Fall back to bucket scan when manifest has 0 entries but bucket has objects (handles the case where a previous server was killed before manifest flush). |
