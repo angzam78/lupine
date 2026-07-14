@@ -911,7 +911,7 @@ struct write_queue {
   std::condition_variable cv;
   std::deque<write_queue_entry> entries;
   bool shutdown = false;
-  static constexpr size_t MAX_ENTRIES = 512;  // 512 × 4 MiB = 2 GiB max
+  static constexpr size_t MAX_ENTRIES = 2048;  // 2048 × 4 MiB = 8 GiB max
   std::atomic<int> put_counter{0};  // shared across workers for manifest flush
 };
 
@@ -1042,6 +1042,27 @@ void lupine_dedup_s3_init() {
 void lupine_dedup_s3_destroy() {
   if (!lupine_dedup_s3_configured()) return;
 
+  // Wait for the write queue to drain before shutting down.
+  // This ensures all pending S3 PUTs complete and the manifest is current.
+  // Bounded to 120 seconds so a stuck connection doesn't block forever.
+  {
+    int wait_seconds = 0;
+    while (wait_seconds < 120) {
+      size_t remaining;
+      {
+        std::lock_guard<std::mutex> lock(get_write_queue().mutex);
+        remaining = get_write_queue().entries.size();
+      }
+      if (remaining == 0) break;
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+      wait_seconds++;
+    }
+    if (wait_seconds >= 120) {
+      LUPINE_LOG_ERROR("S3 write queue did not drain in 120s, "
+                       "forcing shutdown");
+    }
+  }
+
   // Signal shutdown
   {
     std::lock_guard<std::mutex> lock(get_write_queue().mutex);
@@ -1049,7 +1070,7 @@ void lupine_dedup_s3_destroy() {
   }
   get_write_queue().cv.notify_all();
 
-  // Best-effort manifest flush
+  // Flush manifest after queue is drained
   if (g_s3_available.load()) {
     write_manifest_to_s3();
   }
@@ -1092,6 +1113,16 @@ void lupine_dedup_s3_insert_async(const lupine_dedup_hash128 &hash,
                                    const void *compressed_data,
                                    size_t compressed_size) {
   if (!lupine_dedup_s3_available()) return;
+
+  // Skip if this hash is already in the S3 manifest — avoids redundant
+  // uploads when the same model is loaded multiple times.
+  {
+    s3_manifest &m = get_manifest();
+    std::lock_guard<std::mutex> lock(m.mutex);
+    for (auto &e : m.entries) {
+      if (e.hash == hash) return;  // already in S3
+    }
+  }
 
   write_queue_entry entry;
   entry.hash = hash;
