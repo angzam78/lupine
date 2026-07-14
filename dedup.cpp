@@ -454,16 +454,27 @@ void lupine_dedup_server_insert(lupine_dedup_server_cache *c,
               });
     // Evict until we're under cap. Leave 10% headroom to avoid evicting
     // on every single insert.
+    //
+    // When S3 L2 is enabled, skip chunks that haven't been uploaded to S3
+    // yet — evicting them would cause a hard failure if a client sends a
+    // DEDUP_REF for that chunk (L1 miss → S3 miss → hard failure). The
+    // chunk stays in L1 until the S3 upload completes, at which point a
+    // future eviction pass can remove it safely.
+    //
+    // When S3 is not enabled, lupine_dedup_s3_has_hash always returns 1,
+    // so all chunks are eligible for eviction (current behavior — evict
+    // and log to invalidations.log).
     size_t target = impl->byte_cap * 9 / 10;
     for (const auto &f : files) {
       if (new_total <= target) break;
+      lupine_dedup_hash128 evicted_hash;
+      if (!chunk_path_to_hash(f.path, &evicted_hash)) continue;
+      // Skip if S3 upload hasn't completed yet (S3 is the safety net)
+      if (!lupine_dedup_s3_has_hash(evicted_hash)) continue;
       if (unlink(f.path.c_str()) == 0) {
         new_total = update_size_file(impl->cache_dir,
                                      -static_cast<int64_t>(f.size));
-        lupine_dedup_hash128 evicted_hash;
-        if (chunk_path_to_hash(f.path, &evicted_hash)) {
-          append_invalidation_log(impl->cache_dir, evicted_hash);
-        }
+        append_invalidation_log(impl->cache_dir, evicted_hash);
       }
     }
   }

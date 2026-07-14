@@ -65,6 +65,12 @@ void lupine_dedup_s3_scan_hashes(std::vector<lupine_dedup_hash128> *out);
 void lupine_dedup_s3_drain_additions(
     std::vector<lupine_dedup_hash128> *out);
 
+// Returns true if the hash is in the S3 manifest (upload completed).
+// Used by the L1 eviction logic to avoid evicting chunks that haven't
+// been uploaded to S3 yet. If S3 is not available, always returns true
+// (don't block eviction when there's no L2 safety net).
+int lupine_dedup_s3_has_hash(const lupine_dedup_hash128 &hash);
+
 // Cleanup: deletes oldest S3 chunks until total stored size <= byte_cap.
 // Reads the in-memory manifest (which includes timestamps and sizes),
 // sorts by timestamp ascending, batch-deletes the oldest, and rewrites

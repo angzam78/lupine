@@ -1157,6 +1157,18 @@ void lupine_dedup_s3_scan_hashes(std::vector<lupine_dedup_hash128> *out) {
   }
 }
 
+int lupine_dedup_s3_has_hash(const lupine_dedup_hash128 &hash) {
+  // If S3 is not available, return true (don't block eviction —
+  // there's no L2 safety net, so evict normally and log to invalidations.log).
+  if (!lupine_dedup_s3_available()) return 1;
+  s3_manifest &m = get_manifest();
+  std::lock_guard<std::mutex> lock(m.mutex);
+  for (auto &e : m.entries) {
+    if (e.hash == hash) return 1;  // upload completed
+  }
+  return 0;  // not yet uploaded — don't evict
+}
+
 void lupine_dedup_s3_drain_additions(
     std::vector<lupine_dedup_hash128> *out) {
   if (!lupine_dedup_s3_available()) return;
