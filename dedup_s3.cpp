@@ -364,6 +364,9 @@ struct http_client {
         std::string dummy;
         read_line(dummy);
       }
+    } else if (method == "HEAD") {
+      // HEAD responses never have a body, even if Content-Length is set.
+      // Don't try to read any bytes — the server won't send any.
     } else {
       auto cl_it = resp.headers.find("content-length");
       if (cl_it != resp.headers.end()) {
