@@ -286,6 +286,7 @@ struct disk_cache_impl {
   std::vector<lupine_dedup_hash128> additions_send_buffer;
   uint32_t send_count = 0;
   uint32_t additions_send_count = 0;
+  uint32_t inv_count_word = 0;  // stored here so rpc_write pointer is valid
   int invalidation_log_fd = -1;     // for reading new evictions by other procs
   off_t invalidation_log_offset = 0;  // last read position
   int additions_log_fd = -1;        // for reading new inserts by other procs
@@ -625,14 +626,16 @@ int lupine_dedup_server_flush_invalidations(lupine_dedup_server_cache *c,
 
   // Build the inv_count word. If there are additions, set bit 31 to
   // signal "additions follow after the invalidations."
-  uint32_t inv_count = impl->send_count;
+  // Store in impl so the pointer handed to rpc_write remains valid
+  // until rpc_write_end sends it (rpc_write stores pointers, not copies).
+  impl->inv_count_word = impl->send_count;
   bool has_additions = impl->additions_send_count > 0;
   if (has_additions) {
-    inv_count |= 0x80000000u;
+    impl->inv_count_word |= 0x80000000u;
   }
 
   // Write [inv_count]
-  if (rpc_write(conn, &inv_count, sizeof(inv_count)) < 0)
+  if (rpc_write(conn, &impl->inv_count_word, sizeof(impl->inv_count_word)) < 0)
     return -1;
 
   // Write [inv_count × 16-byte hashes]
