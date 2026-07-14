@@ -305,17 +305,17 @@ struct s3_h2_session {
   bool is_alive() const { return sockfd >= 0 && session != nullptr; }
 };
 
-// Global persistent session (one per child process)
-static s3_h2_session *g_h2_session = nullptr;
-static std::mutex g_h2_session_mutex;
+// Thread-local persistent session — each thread gets its own HTTP/2 connection.
+// The write-through thread pool uses one connection per worker, enabling
+// parallel S3 uploads without multiplexing complexity.
+static thread_local s3_h2_session *tls_h2_session = nullptr;
 
-// Get or create the persistent session. On failure, reconnects once.
+// Get or create the thread-local persistent session.
 static s3_h2_session *get_h2_session(const s3_config &cfg) {
-  std::lock_guard<std::mutex> lock(g_h2_session_mutex);
-  if (g_h2_session && g_h2_session->is_alive()) return g_h2_session;
+  if (tls_h2_session && tls_h2_session->is_alive()) return tls_h2_session;
 
-  delete g_h2_session;
-  g_h2_session = new s3_h2_session;
+  delete tls_h2_session;
+  tls_h2_session = new s3_h2_session;
 
   std::string host = cfg.endpoint;
   int port = cfg.use_tls ? 443 : 80;
@@ -325,19 +325,18 @@ static s3_h2_session *get_h2_session(const s3_config &cfg) {
     host = host.substr(0, colon);
   }
 
-  if (!g_h2_session->connect(host, port, cfg.use_tls)) {
-    delete g_h2_session;
-    g_h2_session = nullptr;
+  if (!tls_h2_session->connect(host, port, cfg.use_tls)) {
+    delete tls_h2_session;
+    tls_h2_session = nullptr;
     return nullptr;
   }
-  return g_h2_session;
+  return tls_h2_session;
 }
 
 // Force reconnect (called on error)
 static void reset_h2_session() {
-  std::lock_guard<std::mutex> lock(g_h2_session_mutex);
-  delete g_h2_session;
-  g_h2_session = nullptr;
+  delete tls_h2_session;
+  tls_h2_session = nullptr;
 }
 
 // --- nghttp2 callbacks ---
@@ -1138,6 +1137,7 @@ struct write_queue {
   std::deque<write_queue_entry> entries;
   bool shutdown = false;
   static constexpr size_t MAX_ENTRIES = 512;  // 512 × 4 MiB = 2 GiB max
+  std::atomic<int> put_counter{0};  // shared across workers for manifest flush
 };
 
 write_queue &get_write_queue() {
@@ -1145,7 +1145,11 @@ write_queue &get_write_queue() {
   return q;
 }
 
-void write_through_loop() {
+// Number of parallel S3 upload workers. Each worker has its own persistent
+// HTTP/2 connection, so N workers = N concurrent S3 PUTs.
+constexpr int S3_WRITE_WORKER_COUNT = 8;
+
+void write_through_worker() {
   for (;;) {
     write_queue_entry entry;
     {
@@ -1153,7 +1157,8 @@ void write_through_loop() {
       get_write_queue().cv.wait(lock, [] {
         return get_write_queue().shutdown || !get_write_queue().entries.empty();
       });
-      if (get_write_queue().shutdown) break;
+      if (get_write_queue().shutdown && get_write_queue().entries.empty()) break;
+      if (get_write_queue().entries.empty()) continue;
       entry = std::move(get_write_queue().entries.front());
       get_write_queue().entries.pop_front();
     }
@@ -1166,7 +1171,6 @@ void write_through_loop() {
     }
 
     // Update manifest
-    static thread_local int put_counter = 0;
     bool need_manifest_write = false;
     {
       s3_manifest &m = get_manifest();
@@ -1179,7 +1183,7 @@ void write_through_loop() {
               now.time_since_epoch()).count());
       me.size = entry.data.size();
 
-      // Check if already in manifest (shouldn't be, but just in case)
+      // Check if already in manifest
       bool found = false;
       for (auto &e : m.entries) {
         if (e.hash == me.hash) { found = true; break; }
@@ -1190,15 +1194,14 @@ void write_through_loop() {
         m.dirty = true;
       }
 
-      // Write manifest every 10 PUTs so it's current even if the server
-      // is killed (pkill -9 skips cleanup). This bounds manifest staleness
-      // to 10 chunks (~40 MiB) of loss on ungraceful shutdown.
-      put_counter++;
-      if (put_counter % 10 == 0) {
+      // Write manifest every 20 PUTs (shared counter across all workers)
+      int count = get_write_queue().put_counter.fetch_add(1) + 1;
+      if (count % 20 == 0) {
         need_manifest_write = true;
       }
     }
-    // Write manifest outside the lock to avoid deadlock
+    // Write manifest outside the lock to avoid deadlock.
+    // Only one worker will do this (the one that hits the % 20 boundary).
     if (need_manifest_write) {
       write_manifest_to_s3();
     }
@@ -1224,7 +1227,7 @@ void manifest_flush_loop() {
 }
 
 // Background threads (started per child process).
-std::thread g_write_thread;
+std::vector<std::thread> g_write_threads;
 std::thread g_availability_thread;
 std::thread g_flush_thread;
 
@@ -1253,8 +1256,10 @@ void lupine_dedup_s3_init() {
     LUPINE_LOG_ERROR("S3 L2 cache unavailable at init");
   }
 
-  // Start background threads
-  g_write_thread = std::thread(write_through_loop);
+  // Start background threads — multiple write workers for parallel S3 uploads
+  for (int i = 0; i < S3_WRITE_WORKER_COUNT; i++) {
+    g_write_threads.emplace_back(write_through_worker);
+  }
   g_availability_thread = std::thread(availability_test_loop);
   g_flush_thread = std::thread(manifest_flush_loop);
 }
@@ -1269,22 +1274,15 @@ void lupine_dedup_s3_destroy() {
   }
   get_write_queue().cv.notify_all();
 
-  // Flush manifest if dirty
-  {
-    s3_manifest &m = get_manifest();
-    std::lock_guard<std::mutex> lock(m.mutex);
-    if (m.dirty && g_s3_available.load()) {
-      // Can't call write_manifest_to_s3() under the lock — it takes the lock.
-      // So we unlock and relock.
-    }
-  }
-  // Best-effort flush (may race with shutdown, but that's fine).
+  // Best-effort manifest flush
   if (g_s3_available.load()) {
     write_manifest_to_s3();
   }
 
   // Detach threads (they'll exit when the child process exits)
-  if (g_write_thread.joinable()) g_write_thread.detach();
+  for (auto &t : g_write_threads) {
+    if (t.joinable()) t.detach();
+  }
   if (g_availability_thread.joinable()) g_availability_thread.detach();
   if (g_flush_thread.joinable()) g_flush_thread.detach();
 }
@@ -1340,7 +1338,7 @@ void lupine_dedup_s3_insert_async(const lupine_dedup_hash128 &hash,
     return;
   }
   get_write_queue().entries.push_back(std::move(entry));
-  get_write_queue().cv.notify_one();
+  get_write_queue().cv.notify_all();  // wake all workers for parallel processing
 }
 
 void lupine_dedup_s3_scan_hashes(std::vector<lupine_dedup_hash128> *out) {
