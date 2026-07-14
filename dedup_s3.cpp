@@ -217,6 +217,7 @@ struct s3_h2_session {
   std::string host;
   int port = 443;
   bool use_tls = true;
+  bool use_http1 = false;  // true if server doesn't support HTTP/2
 
   ~s3_h2_session() { close_conn(); }
 
@@ -256,27 +257,31 @@ struct s3_h2_session {
       ssl_ctx = SSL_CTX_new(TLS_client_method());
       if (!ssl_ctx) return false;
       SSL_CTX_set_default_verify_paths(ssl_ctx);
-      // Offer HTTP/2 via ALPN. If the server doesn't support h2, ALPN
-      // fails and we fall back (the caller checks for h2 negotiation).
-      SSL_CTX_set_alpn_protos(ssl_ctx,
-          (const unsigned char *)"\x02h2", 3);
+      // Offer both h2 and http/1.1 via ALPN. Some S3-compatible servers
+      // (e.g., B2) only support HTTP/1.1 — we fall back gracefully.
+      static const unsigned char alpn_protos[] = {
+        2, 'h', '2',              // HTTP/2
+        8, 'h', 't', 't', 'p', '/', '1', '.', '1'  // HTTP/1.1
+      };
+      SSL_CTX_set_alpn_protos(ssl_ctx, alpn_protos, sizeof(alpn_protos));
       ssl = SSL_new(ssl_ctx);
       if (!ssl) return false;
       SSL_set_tlsext_host_name(ssl, host.c_str());
       SSL_set_fd(ssl, sockfd);
       if (SSL_connect(ssl) != 1) return false;
 
-      // Verify ALPN selected h2
+      // Check ALPN result — if the server selected http/1.1, skip nghttp2
+      // and use HTTP/1.1 with keep-alive on the persistent TLS connection.
       const unsigned char *proto = nullptr;
       unsigned int proto_len = 0;
       SSL_get0_alpn_selected(ssl, &proto, &proto_len);
       if (proto_len != 2 || memcmp(proto, "h2", 2) != 0) {
-        LUPINE_LOG_ERROR("S3 server does not support HTTP/2 (ALPN)");
-        return false;
+        use_http1 = true;
+        return true;  // skip nghttp2 setup — HTTP/1.1 path will be used
       }
     }
 
-    // Create nghttp2 client session
+    // Create nghttp2 client session (only if h2 was negotiated)
     nghttp2_session_callbacks *callbacks = nullptr;
     if (nghttp2_session_callbacks_new(&callbacks) != 0) return false;
     nghttp2_session_callbacks_set_send_callback(callbacks, s3_send_cb);
@@ -440,6 +445,143 @@ static nghttp2_nv make_nv(const std::string &name, const std::string &value) {
   return nv;
 }
 
+// HTTP/1.1 request on the persistent TLS connection (keep-alive).
+// Used when the S3 server doesn't support HTTP/2 (e.g., B2).
+// Reuses the session's SSL connection — no new TLS handshake per request.
+static bool s3_http1_request(s3_h2_session *sess,
+                              const std::string &method,
+                              const std::string &authority,
+                              const std::string &path,
+                              const std::vector<std::pair<std::string, std::string>> &headers,
+                              const void *body, size_t body_size,
+                              s3_response &resp) {
+  // Build HTTP/1.1 request
+  std::string req = method + " " + path + " HTTP/1.1\r\n";
+  req += "Host: " + authority + "\r\n";
+  for (auto &h : headers) {
+    req += h.first + ": " + h.second + "\r\n";
+  }
+  req += "Content-Length: " + std::to_string(body_size) + "\r\n";
+  req += "Connection: keep-alive\r\n";
+  req += "\r\n";
+
+  // Write request line + headers
+  const char *p = req.data();
+  size_t remaining = req.size();
+  while (remaining > 0) {
+    int n;
+    if (sess->ssl) {
+      n = SSL_write(sess->ssl, p, static_cast<int>(remaining));
+    } else {
+      n = ::send(sess->sockfd, p, remaining, 0);
+    }
+    if (n <= 0) return false;
+    p += n;
+    remaining -= static_cast<size_t>(n);
+  }
+
+  // Write body
+  if (body_size > 0) {
+    p = static_cast<const char *>(body);
+    remaining = body_size;
+    while (remaining > 0) {
+      int n;
+      if (sess->ssl) {
+        n = SSL_write(sess->ssl, p, static_cast<int>(remaining));
+      } else {
+        n = ::send(sess->sockfd, p, remaining, 0);
+      }
+      if (n <= 0) return false;
+      p += n;
+      remaining -= static_cast<size_t>(n);
+    }
+  }
+
+  // Read response — status line
+  auto read_line = [&sess]() -> std::string {
+    std::string line;
+    for (;;) {
+      unsigned char c;
+      int n;
+      if (sess->ssl) {
+        n = SSL_read(sess->ssl, &c, 1);
+      } else {
+        n = ::recv(sess->sockfd, &c, 1, 0);
+      }
+      if (n <= 0) return "";
+      line += static_cast<char>(c);
+      if (line.size() >= 2 && line[line.size()-2] == '\r' && line[line.size()-1] == '\n') {
+        line.resize(line.size()-2);
+        return line;
+      }
+    }
+  };
+
+  std::string status_line = read_line();
+  if (status_line.empty()) return false;
+  {
+    auto sp1 = status_line.find(' ');
+    if (sp1 == std::string::npos) return false;
+    auto sp2 = status_line.find(' ', sp1 + 1);
+    std::string code_str = (sp2 == std::string::npos)
+        ? status_line.substr(sp1 + 1)
+        : status_line.substr(sp1 + 1, sp2 - sp1 - 1);
+    resp.status = std::atoi(code_str.c_str());
+  }
+
+  // Read headers
+  for (;;) {
+    std::string line = read_line();
+    if (line.empty()) break;
+    auto colon = line.find(':');
+    if (colon != std::string::npos) {
+      std::string key = line.substr(0, colon);
+      std::string val = line.substr(colon + 1);
+      while (!val.empty() && val[0] == ' ') val = val.substr(1);
+      std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+      resp.headers[key] = val;
+    }
+  }
+
+  // Read body
+  resp.body.clear();
+  resp.complete = true;
+  if (method == "HEAD") return true;  // no body for HEAD
+
+  auto cl_it = resp.headers.find("content-length");
+  if (cl_it != resp.headers.end()) {
+    size_t cl = std::stoul(cl_it->second);
+    resp.body.resize(cl);
+    char *bp = reinterpret_cast<char *>(resp.body.data());
+    size_t to_read = cl;
+    while (to_read > 0) {
+      int n;
+      if (sess->ssl) {
+        n = SSL_read(sess->ssl, bp, static_cast<int>(std::min(to_read, static_cast<size_t>(16384))));
+      } else {
+        n = ::recv(sess->sockfd, bp, to_read, 0);
+      }
+      if (n <= 0) return false;
+      bp += n;
+      to_read -= static_cast<size_t>(n);
+    }
+  } else {
+    // Read until connection close or EOF
+    char buf[8192];
+    for (;;) {
+      int n;
+      if (sess->ssl) {
+        n = SSL_read(sess->ssl, buf, sizeof(buf));
+      } else {
+        n = ::recv(sess->sockfd, buf, sizeof(buf), 0);
+      }
+      if (n <= 0) break;
+      resp.body.insert(resp.body.end(), buf, buf + n);
+    }
+  }
+  return true;
+}
+
 // Synchronous HTTP/2 request: submit, drive I/O loop, return response.
 // The session is reused across calls (persistent TLS+H2 connection).
 static bool s3_h2_request(const s3_config &cfg,
@@ -451,6 +593,13 @@ static bool s3_h2_request(const s3_config &cfg,
                            s3_response &resp) {
   s3_h2_session *sess = get_h2_session(cfg);
   if (!sess) return false;
+
+  // If the server doesn't support HTTP/2, use HTTP/1.1 with keep-alive
+  // on the persistent TLS connection.
+  if (sess->use_http1) {
+    return s3_http1_request(sess, method, host, path,
+                             signed_headers, body, body_size, resp);
+  }
 
   // Build HTTP/2 pseudo-headers + signed headers
   std::vector<nghttp2_nv> nvs;
