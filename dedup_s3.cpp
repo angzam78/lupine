@@ -423,10 +423,10 @@ signed_request s3_sign(
   std::string date_stamp = date_str;
 
   // Build canonical headers (must be sorted by key, lowercase).
-  // Note: x-amz-content-sha256 is sent as a header but NOT included in
-  // the signed headers, matching boto3's behavior for B2 compatibility.
+  // B2 requires x-amz-content-sha256 to be included in the signature.
   std::map<std::string, std::string> hdrs;
   hdrs["host"] = host;
+  hdrs["x-amz-content-sha256"] = payload_hash;
   hdrs["x-amz-date"] = amz_date;
 
   std::string canonical_headers;
@@ -456,9 +456,13 @@ signed_request s3_sign(
   string_to_sign += hashed_cr;
 
   // Signing key: HMAC chain
-  std::string k_date_input = cfg.secret_key + date_stamp;
+  // k_date = HMAC("AWS4" + secret_key, date_stamp)
+  // k_region = HMAC(k_date, region)
+  // k_service = HMAC(k_region, "s3")
+  // k_signing = HMAC(k_service, "aws4_request")
+  std::string k_secret = "AWS4" + cfg.secret_key;
   unsigned char k_date[32], k_region[32], k_service[32], k_signing[32];
-  hmac_sha256(k_date_input.data(), k_date_input.size(),
+  hmac_sha256(k_secret.data(), k_secret.size(),
               date_stamp.data(), date_stamp.size(), k_date);
   hmac_sha256(k_date, 32, cfg.region.data(), cfg.region.size(), k_region);
   hmac_sha256(k_region, 32, "s3", 2, k_service);
@@ -487,9 +491,6 @@ signed_request s3_sign(
   for (auto &h : hdrs) {
     sr.headers.push_back({h.first, h.second});
   }
-  // x-amz-content-sha256 is sent as a header (B2 requires it) but not
-  // included in the signed headers, matching boto3's behavior.
-  sr.headers.push_back({"x-amz-content-sha256", payload_hash});
   sr.headers.push_back({"authorization", auth});
   sr.headers.push_back({"Content-Length", std::to_string(body_size)});
   return sr;
