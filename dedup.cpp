@@ -822,6 +822,21 @@ void lupine_dedup_conn_init(conn_t *conn, int is_server) {
   }
 }
 
+// Drain `bytes` bytes from the connection in fixed-size chunks. Used to keep
+// the wire frame aligned when we want to abandon a hash-list response without
+// consuming the rest of it (e.g. count exceeds the sanity bound, or a batch
+// read failed mid-stream). Without this drain, the next rpc_dispatch() read
+// would pick up the first bytes of the unread hash data as a request_id and
+// corrupt the connection.
+static void lupine_dedup_drain_remaining(conn_t *conn, uint64_t bytes) {
+  uint8_t scratch[4096];
+  while (bytes > 0) {
+    size_t chunk = std::min(sizeof(scratch), static_cast<size_t>(bytes));
+    if (rpc_read(conn, scratch, chunk) < 0) break;
+    bytes -= chunk;
+  }
+}
+
 void lupine_dedup_client_populate_from_server(conn_t *conn) {
   if (conn == nullptr || !lupine_dedup_enabled(conn)) {
     return;
@@ -847,29 +862,65 @@ void lupine_dedup_client_populate_from_server(conn_t *conn) {
     LUPINE_LOG_ERROR("lupine_dedup_client_populate_from_server: count read failed");
     return;
   }
-  if (count > 0) {
-    if (count > (64u * 1024u)) {  // sanity bound: 64K entries = 1 MiB
-      rpc_read_end(conn);
-      LUPINE_LOG_ERROR("lupine_dedup_client_populate_from_server: count too large");
-      return;
-    }
-    std::vector<lupine_dedup_hash128> hashes(count);
-    size_t bytes = count * sizeof(lupine_dedup_hash128);
-    int n = rpc_read(conn, hashes.data(), bytes);
-    if (n < 0 || static_cast<size_t>(n) != bytes) {
-      rpc_read_end(conn);
-      LUPINE_LOG_ERROR("lupine_dedup_client_populate_from_server: hash read failed");
-      return;
-    }
-    auto *mirror = static_cast<lupine_dedup_client_cache *>(
-        conn->dedup_client_cache);
-    for (const auto &h : hashes) {
-      lupine_dedup_client_add(mirror, h);
-    }
-    LUPINE_TRACE_LOG("LUPINE dedup populated mirror with " << count << " hashes from server");
-  } else {
-    LUPINE_TRACE_LOG("LUPINE dedup server has 0 cached chunks");
+
+  // Sanity bound to keep count * 16 arithmetic safe from overflow and to
+  // reject obviously-bogus server responses. 256M entries = 4 GiB of hashes,
+  // far above any realistic cache (a 1 TiB compressed cache holds ~524K
+  // chunks). On bail we must drain the remaining hash bytes so the next
+  // rpc_dispatch() read sees a clean frame boundary.
+  if (static_cast<uint64_t>(count) > (256ull * 1024ull * 1024ull)) {
+    LUPINE_LOG_ERROR("lupine_dedup_client_populate_from_server: count too large");
+    lupine_dedup_drain_remaining(conn,
+                                 static_cast<uint64_t>(count) * 16);
+    rpc_read_end(conn);
+    return;
   }
+
+  auto *mirror = static_cast<lupine_dedup_client_cache *>(
+      conn->dedup_client_cache);
+
+  if (count == 0) {
+    LUPINE_TRACE_LOG("LUPINE dedup server has 0 cached chunks");
+    rpc_read_end(conn);
+    return;
+  }
+
+  // Stream the hashes in fixed-size batches. This bounds client RAM to
+  // kBatchEntries * 16 bytes (64 KiB) regardless of cache size, so a 1 TiB
+  // cache with ~524K chunks doesn't require a 8 MiB allocation up front. The
+  // mirror is populated incrementally as each batch arrives.
+  constexpr uint32_t kBatchEntries = 4096;  // 4096 * 16 = 64 KiB
+  std::vector<lupine_dedup_hash128> batch(kBatchEntries);
+  uint32_t added = 0;
+  bool read_failed = false;
+  while (added < count) {
+    uint32_t batch_size = std::min(kBatchEntries, count - added);
+    size_t batch_bytes =
+        static_cast<size_t>(batch_size) * sizeof(lupine_dedup_hash128);
+    int n = rpc_read(conn, batch.data(), batch_bytes);
+    if (n < 0 || static_cast<size_t>(n) != batch_bytes) {
+      read_failed = true;
+      break;
+    }
+    for (uint32_t i = 0; i < batch_size; ++i) {
+      lupine_dedup_client_add(mirror, batch[i]);
+    }
+    added += batch_size;
+  }
+
+  if (read_failed) {
+    // Drain the unread hash bytes (count - added) * 16 so the connection
+    // stays frame-aligned. Without this drain, the next rpc_dispatch() read
+    // would interpret hash bytes as a request_id and corrupt the stream.
+    lupine_dedup_drain_remaining(
+        conn, static_cast<uint64_t>(count - added) * 16);
+    rpc_read_end(conn);
+    LUPINE_LOG_ERROR("lupine_dedup_client_populate_from_server: hash read failed");
+    return;
+  }
+
+  LUPINE_TRACE_LOG("LUPINE dedup populated mirror with " << count
+                   << " hashes from server");
   rpc_read_end(conn);
 }
 
