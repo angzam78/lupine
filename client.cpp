@@ -565,6 +565,11 @@ static int lupine_connect_endpoint(conn_t *conn,
     goto error;
   }
 
+  // Dedup: if enabled, request the server's hash list and populate the
+  // client mirror. This makes the first upload after a server restart get
+  // HITs (the mirror reflects the server's disk cache state).
+  lupine_dedup_client_populate_from_server(conn);
+
   freeaddrinfo(res);
   return 0;
 

@@ -75,6 +75,7 @@ void rpc_conn_destroy(conn_t *conn) {
   }
   rpc_http2_destroy(conn);
   rpc_write_queue_free(conn);
+  lupine_dedup_conn_destroy(conn);
   pthread_mutex_destroy(&conn->read_mutex);
   pthread_mutex_destroy(&conn->write_mutex);
   pthread_mutex_destroy(&conn->call_mutex);
@@ -241,6 +242,13 @@ int rpc_read_start(conn_t *conn, int write_id) {
     pthread_mutex_unlock(&conn->read_mutex);
     return -1;
   }
+  if (conn->dedup_client_cache != nullptr &&
+      lupine_dedup_read_invalidations(conn) < 0) {
+    rpc_mark_connection_closed(conn);
+    pthread_cond_broadcast(&conn->read_cond);
+    pthread_mutex_unlock(&conn->read_mutex);
+    return -1;
+  }
   pthread_mutex_unlock(&conn->read_mutex);
   return 0;
 }
@@ -348,6 +356,11 @@ int rpc_write_start_response(conn_t *conn, const int read_id) {
   conn->write_id = read_id;
   conn->write_op = -1;
   conn->write_lane_id = conn->read_lane_id;
+  if (conn->dedup_server_cache != nullptr &&
+      lupine_dedup_flush_for_response(conn) < 0) {
+    pthread_mutex_unlock(&conn->write_mutex);
+    return -1;
+  }
   return 0;
 }
 

@@ -7,6 +7,8 @@
 #include <stdint.h>
 #include <vector>
 
+#include "dedup.h"
+
 // Uncompressed block size for the optional LZ4 payload framing. The framed
 // bytes are produced lazily, one block at a time, by the HTTP/2 transport
 // (h2.cpp) and decoded by the rpc_read_payload helpers (compress.cpp).
@@ -58,6 +60,11 @@ struct conn_t {
   int closed;
   void *http2;
   void *tls_session; // SSL* for https:// client connections; otherwise null.
+  // Per-connection dedup caches (see dedup.h). On a server connection only
+  // dedup_server_cache is set; on a client connection only
+  // dedup_client_cache is set. Both are nullptr if LUPINE_DEDUP=0.
+  void *dedup_server_cache;
+  void *dedup_client_cache;
 };
 
 extern int rpc_dispatch(conn_t *conn, int parity);

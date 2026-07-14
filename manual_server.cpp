@@ -3290,6 +3290,35 @@ int handle_manual_lupineManagedHostFlush(conn_t *conn) {
   }
   return 0;
 }
+
+// handle_manual_lupineDedupHashList: server scans its disk cache and sends
+// the list of cached chunk hashes to the client. The client populates its
+// mirror from this list, so the first upload after a server restart gets
+// HITs instead of full MISSes. See dedup.h and docs/dedup-architecture.md.
+int handle_manual_lupineDedupHashList(conn_t *conn) {
+  int request_id = rpc_read_end(conn);
+  if (request_id < 0) {
+    return -1;
+  }
+
+  // Scan the disk cache directory and collect all chunk hashes.
+  std::vector<lupine_dedup_hash128> hashes;
+  auto *cache = static_cast<lupine_dedup_server_cache *>(
+      conn->dedup_server_cache);
+  if (cache != nullptr) {
+    lupine_dedup_server_scan_hashes(cache, &hashes);
+  }
+
+  uint32_t count = static_cast<uint32_t>(hashes.size());
+  if (rpc_write_start_response(conn, request_id) < 0 ||
+      rpc_write(conn, &count, sizeof(count)) < 0 ||
+      (count > 0 && rpc_write(conn, hashes.data(),
+                              count * sizeof(lupine_dedup_hash128)) < 0) ||
+      rpc_write_end(conn) < 0) {
+    return -1;
+  }
+  return 0;
+}
 int handle_manual_cuMemcpyAtoH_v2(conn_t *conn) {
   CUarray srcArray = nullptr;
   size_t srcOffset = 0;

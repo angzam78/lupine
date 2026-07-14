@@ -188,6 +188,7 @@ PRIVATE_RPC_FUNCTIONS = [
     "cuStreamBeginCaptureToGraph",
     "cuStreamGetCaptureInfo_v3",
     "lupineManagedHostFlush",
+    "lupineDedupHashList",
 ]
 
 

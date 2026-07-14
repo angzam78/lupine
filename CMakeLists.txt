@@ -39,6 +39,7 @@ include_directories(
     ${CUDAToolkit_INCLUDE_DIRS}
     ${NGHTTP2_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/lz4
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/xxhash
 )
 
 # LZ4 is vendored (third_party/lz4, BSD-2-Clause) so builds do not depend on a
@@ -52,10 +53,19 @@ if(NOT MSVC AND NOT CMAKE_BUILD_TYPE)
   target_compile_options(lupine_lz4 PRIVATE -O2)
 endif()
 
+# xxHash is vendored (third_party/xxhash, BSD-2-Clause) for the dedup cache's
+# 128-bit content hashing (XXH3_128bits). Built as a plain C static library.
+add_library(lupine_xxhash STATIC ${CMAKE_CURRENT_SOURCE_DIR}/third_party/xxhash/xxhash.c)
+set_target_properties(lupine_xxhash PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(NOT MSVC AND NOT CMAKE_BUILD_TYPE)
+  target_compile_options(lupine_xxhash PRIVATE -O2)
+endif()
+
 set(CLIENT_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/h2.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/rpc.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/compress.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/dedup.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cache.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/client.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/routing.cpp
@@ -72,6 +82,7 @@ set(SERVER_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/nvml_server.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/rpc.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/compress.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/dedup.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/codegen/gen_server.cpp
 )
 
@@ -79,6 +90,7 @@ set(NVML_CLIENT_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/h2.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/rpc.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/compress.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/dedup.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/nvml_client.cpp
 )
 
@@ -86,12 +98,14 @@ set(CLIENT_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/cache.h
     ${CMAKE_CURRENT_SOURCE_DIR}/client_routing.h
     ${CMAKE_CURRENT_SOURCE_DIR}/codegen/gen_client.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/dedup.h
     ${CMAKE_CURRENT_SOURCE_DIR}/memcpy.h
     ${CMAKE_CURRENT_SOURCE_DIR}/copy_pipeline.h
 )
 
 set(SERVER_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/codegen/gen_server.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/dedup.h
     ${CMAKE_CURRENT_SOURCE_DIR}/lupine_platform.h
     ${CMAKE_CURRENT_SOURCE_DIR}/manual_server.h
     ${CMAKE_CURRENT_SOURCE_DIR}/copy_pipeline.h
@@ -111,7 +125,7 @@ if (NOT WIN32)
       target_compile_definitions(${CLIENT_OUTPUT} PRIVATE LUPINE_TLS_OPENSSL)
       target_link_libraries(${CLIENT_OUTPUT} PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     endif()
-    target_link_libraries(${CLIENT_OUTPUT} PRIVATE stdc++ ${NGHTTP2_LIBRARY} lupine_lz4)
+    target_link_libraries(${CLIENT_OUTPUT} PRIVATE stdc++ ${NGHTTP2_LIBRARY} lupine_lz4 lupine_xxhash)
     target_link_options(${CLIENT_OUTPUT} PRIVATE
         "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/client.exports"
     )
@@ -128,7 +142,7 @@ if (NOT WIN32)
       target_compile_definitions(${NVML_CLIENT_OUTPUT} PRIVATE LUPINE_TLS_OPENSSL)
       target_link_libraries(${NVML_CLIENT_OUTPUT} PRIVATE OpenSSL::SSL OpenSSL::Crypto)
     endif()
-    target_link_libraries(${NVML_CLIENT_OUTPUT} PRIVATE stdc++ ${NGHTTP2_LIBRARY} lupine_lz4)
+    target_link_libraries(${NVML_CLIENT_OUTPUT} PRIVATE stdc++ ${NGHTTP2_LIBRARY} lupine_lz4 lupine_xxhash)
     target_link_options(${NVML_CLIENT_OUTPUT} PRIVATE
         "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/nvml.exports"
     )
@@ -143,7 +157,7 @@ endif()
 add_executable(${SERVER_OUTPUT} ${SERVER_SOURCES} ${SERVER_HEADERS})
 target_include_directories(${SERVER_OUTPUT} PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
 target_compile_definitions(${SERVER_OUTPUT} PRIVATE LUPINE_RPC_SERVER)
-target_link_libraries(${SERVER_OUTPUT} PRIVATE CUDA::cuda_driver ${NGHTTP2_LIBRARY} lupine_lz4)
+target_link_libraries(${SERVER_OUTPUT} PRIVATE CUDA::cuda_driver ${NGHTTP2_LIBRARY} lupine_lz4 lupine_xxhash)
 
 if (WIN32)
     target_link_libraries(${SERVER_OUTPUT} PRIVATE ws2_32)
@@ -154,9 +168,10 @@ else()
         ${CMAKE_CURRENT_SOURCE_DIR}/h2.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/rpc.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/compress.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/dedup.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/h2_test.cpp
     )
-    target_link_libraries(h2_test PRIVATE stdc++ ${NGHTTP2_LIBRARY} lupine_lz4 pthread)
+    target_link_libraries(h2_test PRIVATE stdc++ ${NGHTTP2_LIBRARY} lupine_lz4 lupine_xxhash pthread)
 
     enable_testing()
     add_test(NAME h2_test COMMAND h2_test)

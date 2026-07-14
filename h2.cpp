@@ -653,6 +653,7 @@ int h2_init_direct(conn_t *conn, bool server) {
     delete transport;
     return -1;
   }
+  lupine_dedup_conn_init(conn, server);
   return 0;
 }
 
