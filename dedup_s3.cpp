@@ -947,7 +947,7 @@ struct write_queue {
   std::condition_variable cv;
   std::deque<write_queue_entry> entries;
   bool shutdown = false;
-  static constexpr size_t MAX_ENTRIES = 64;  // 64 × 4 MiB = 256 MiB max
+  static constexpr size_t MAX_ENTRIES = 512;  // 512 × 4 MiB = 2 GiB max
 };
 
 write_queue &get_write_queue() {
@@ -976,6 +976,8 @@ void write_through_loop() {
     }
 
     // Update manifest
+    static thread_local int put_counter = 0;
+    bool need_manifest_write = false;
     {
       s3_manifest &m = get_manifest();
       std::lock_guard<std::mutex> lock(m.mutex);
@@ -997,14 +999,26 @@ void write_through_loop() {
         m.new_additions.push_back(me.hash);
         m.dirty = true;
       }
+
+      // Write manifest every 10 PUTs so it's current even if the server
+      // is killed (pkill -9 skips cleanup). This bounds manifest staleness
+      // to 10 chunks (~40 MiB) of loss on ungraceful shutdown.
+      put_counter++;
+      if (put_counter % 10 == 0) {
+        need_manifest_write = true;
+      }
+    }
+    // Write manifest outside the lock to avoid deadlock
+    if (need_manifest_write) {
+      write_manifest_to_s3();
     }
   }
 }
 
-// Periodic manifest flush (every 30s if dirty).
+// Periodic manifest flush (every 5s if dirty).
 void manifest_flush_loop() {
   for (;;) {
-    std::this_thread::sleep_for(std::chrono::seconds(30));
+    std::this_thread::sleep_for(std::chrono::seconds(5));
     if (!lupine_dedup_s3_configured()) break;
     if (!g_s3_available.load()) continue;
     s3_manifest &m = get_manifest();
