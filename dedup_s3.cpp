@@ -307,7 +307,11 @@ struct s3_h2_session {
     return true;
   }
 
-  bool is_alive() const { return sockfd >= 0 && session != nullptr; }
+  bool is_alive() const {
+    // HTTP/1.1 mode: session is nullptr but ssl/sockfd are valid
+    // HTTP/2 mode: session is non-null
+    return sockfd >= 0 && (session != nullptr || use_http1);
+  }
 };
 
 // Thread-local persistent session — each thread gets its own HTTP/2 connection.
@@ -457,7 +461,15 @@ static bool s3_http1_request(s3_h2_session *sess,
                               s3_response &resp) {
   // Build HTTP/1.1 request
   std::string req = method + " " + path + " HTTP/1.1\r\n";
-  req += "Host: " + authority + "\r\n";
+  // Check if Host is already in the signed headers (s3_sign adds it).
+  // Don't add a duplicate — that causes 400 errors.
+  bool has_host = false;
+  for (auto &h : headers) {
+    if (h.first == "host" || h.first == "Host") { has_host = true; break; }
+  }
+  if (!has_host) {
+    req += "Host: " + authority + "\r\n";
+  }
   for (auto &h : headers) {
     req += h.first + ": " + h.second + "\r\n";
   }
