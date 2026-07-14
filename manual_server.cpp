@@ -41,6 +41,7 @@
 #include "codegen/gen_api.h"
 #include "codegen/gen_server.h"
 #include "copy_pipeline.h"
+#include "dedup_s3.h"
 #include "lupine_attr_sizes.h"
 #include "lupine_fatbin.h"
 #include "lupine_log.h"
@@ -3307,6 +3308,13 @@ int handle_manual_lupineDedupHashList(conn_t *conn) {
       conn->dedup_server_cache);
   if (cache != nullptr) {
     lupine_dedup_server_scan_hashes(cache, &hashes);
+  }
+
+  // If S3 L2 is configured, also include S3-cached hashes so the client's
+  // initial mirror covers both L1 and L2. Dedup is handled implicitly by
+  // the client's mirror (which is an unordered_set).
+  if (lupine_dedup_s3_configured()) {
+    lupine_dedup_s3_scan_hashes(&hashes);
   }
 
   uint32_t count = static_cast<uint32_t>(hashes.size());

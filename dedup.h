@@ -222,9 +222,28 @@ void lupine_dedup_conn_destroy(conn_t *conn);
 // success, -1 on read failure.
 int lupine_dedup_read_invalidations(conn_t *conn);
 
-// Flushes pending invalidations as the first bytes of a response. Called
-// from rpc_write_start_response when the connection has a server cache.
+// Flushes pending invalidations AND additions as the first bytes of a
+// response. Called from rpc_write_start_response when the connection has
+// a server cache.
+//
+// Wire format (when additions are present):
+//   [u32 inv_count | 0x80000000] [u32 add_count] [inv × 16] [add × 16]
+// When no additions:
+//   [u32 inv_count] [inv × 16]
+// Bit 31 of inv_count signals "additions follow." Real inv_count values
+// never exceed 256M, so bit 31 is always available. The 0xFFFFFFFF
+// clear-all marker is checked before the bit-31 test (it has all bits set).
+//
+// add_count is capped at 4096 per response to bound the prefix size.
+// Remaining additions are sent on subsequent responses.
+//
 // Returns 0 on success, -1 on write failure.
 int lupine_dedup_flush_for_response(conn_t *conn);
+
+// Appends a hash to the shared additions log. Called after a successful
+// local-disk insert to notify other forked children (and their clients)
+// that this chunk is now cached.
+void lupine_dedup_server_append_addition(
+    const lupine_dedup_hash128 &hash);
 
 #endif

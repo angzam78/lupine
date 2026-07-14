@@ -15,6 +15,7 @@
 // analyzed (SMHasher-certified).
 
 #include "dedup.h"
+#include "dedup_s3.h"
 #include "rpc.h"
 #include "lupine_log.h"
 #include "codegen/gen_api.h"  // LUPINE_RPC_lupineDedupHashList
@@ -229,6 +230,19 @@ void append_invalidation_log(const std::string &cache_dir,
   close(fd);
 }
 
+// Appends a hash to the shared additions log. Same pattern as
+// append_invalidation_log, but for insertions (not evictions). Other
+// processes drain the log on each response and forward additions to
+// their clients via the bit-31 response prefix.
+void append_addition_log(const std::string &cache_dir,
+                          const lupine_dedup_hash128 &hash) {
+  std::string path = cache_dir + "/additions.log";
+  int fd = open(path.c_str(), O_WRONLY | O_APPEND | O_CREAT, 0600);
+  if (fd < 0) return;
+  write(fd, hash.bytes, sizeof(hash.bytes));
+  close(fd);
+}
+
 // Scans the chunks directory and collects all chunk files with their mtimes
 // and sizes. Used for eviction.
 struct chunk_file_info {
@@ -265,12 +279,17 @@ void scan_chunks_dir(const std::string &chunks_dir,
 struct disk_cache_impl {
   std::string cache_dir;
   size_t byte_cap = 0;
-  std::mutex mutex;  // protects pending_invalidations, send_buffer, send_count
+  std::mutex mutex;  // protects pending_*, send_*, additions_*
   std::vector<lupine_dedup_hash128> pending_invalidations;
-  std::vector<lupine_dedup_hash128> send_buffer;
+  std::vector<lupine_dedup_hash128> pending_additions;
+  std::vector<lupine_dedup_hash128> send_buffer;       // reused for inv or add
+  std::vector<lupine_dedup_hash128> additions_send_buffer;
   uint32_t send_count = 0;
+  uint32_t additions_send_count = 0;
   int invalidation_log_fd = -1;     // for reading new evictions by other procs
   off_t invalidation_log_offset = 0;  // last read position
+  int additions_log_fd = -1;        // for reading new inserts by other procs
+  off_t additions_log_offset = 0;   // last read position
 };
 
 } // namespace
@@ -286,10 +305,18 @@ lupine_dedup_server_cache *lupine_dedup_server_create(size_t byte_cap) {
 
   // Open invalidation log for reading. Seek to end so we only read new
   // entries (evictions by other processes that happen after our start).
-  std::string log_path = impl->cache_dir + "/invalidations.log";
-  impl->invalidation_log_fd = open(log_path.c_str(), O_RDONLY | O_CREAT, 0600);
+  std::string inv_path = impl->cache_dir + "/invalidations.log";
+  impl->invalidation_log_fd = open(inv_path.c_str(), O_RDONLY | O_CREAT, 0600);
   if (impl->invalidation_log_fd >= 0) {
     impl->invalidation_log_offset = lseek(impl->invalidation_log_fd, 0, SEEK_END);
+  }
+
+  // Open additions log for reading. Same pattern: seek to end so we only
+  // read new inserts by other processes after our start.
+  std::string add_path = impl->cache_dir + "/additions.log";
+  impl->additions_log_fd = open(add_path.c_str(), O_RDONLY | O_CREAT, 0600);
+  if (impl->additions_log_fd >= 0) {
+    impl->additions_log_offset = lseek(impl->additions_log_fd, 0, SEEK_END);
   }
 
   return reinterpret_cast<lupine_dedup_server_cache *>(impl);
@@ -302,6 +329,9 @@ void lupine_dedup_server_destroy(lupine_dedup_server_cache *c) {
   // persists across server restarts. Only close file descriptors.
   if (impl->invalidation_log_fd >= 0) {
     close(impl->invalidation_log_fd);
+  }
+  if (impl->additions_log_fd >= 0) {
+    close(impl->additions_log_fd);
   }
   delete impl;
 }
@@ -436,6 +466,19 @@ void lupine_dedup_server_insert(lupine_dedup_server_cache *c,
       }
     }
   }
+
+  // Notify other forked children (and their clients) that this chunk is now
+  // cached. The additions.log is drained by each child on its next response
+  // flush, and the hashes are forwarded to clients via the bit-31 prefix.
+  append_addition_log(impl->cache_dir, h);
+
+  // Async write-through to S3 L2 (if configured). Non-blocking — the data
+  // is copied into the write queue. If the queue is full, the entry is
+  // dropped (best-effort; the chunk is still in L1).
+  if (lupine_dedup_s3_available()) {
+    lupine_dedup_s3_insert_async(h, chunk, chunk_size,
+                                  write_data, write_size);
+  }
 }
 
 bool lupine_dedup_server_lookup(lupine_dedup_server_cache *c,
@@ -447,9 +490,19 @@ bool lupine_dedup_server_lookup(lupine_dedup_server_cache *c,
   std::string path = hash_to_chunk_path(impl->cache_dir, hash);
   int fd = open(path.c_str(), O_RDONLY);
   if (fd < 0) {
-    // File doesn't exist — miss. Could be: never cached, evicted by this
-    // process, or evicted by another fork. The caller handles this as
-    // a miss (Option A invalidation if the client expected a HIT).
+    // Local disk miss. Try S3 L2 if configured. On S3 hit, the bytes are
+    // written to dst and the caller will promote them to L1 via
+    // lupine_dedup_server_insert (which will get EEXIST on the O_CREAT|O_EXCL
+    // if another thread raced us, or will write a fresh L1 copy).
+    if (lupine_dedup_s3_available() &&
+        lupine_dedup_s3_lookup(hash, expected_chunk_size, dst)) {
+      LUPINE_TRACE_LOG("LUPINE dedup S2 HIT chunk_size=" << expected_chunk_size);
+      return true;
+    }
+    // File doesn't exist on disk or S3 — miss. Could be: never cached,
+    // evicted by this process, or evicted by another fork. The caller
+    // handles this as a miss (Option A invalidation if the client
+    // expected a HIT).
     return false;
   }
 
@@ -526,6 +579,27 @@ int lupine_dedup_server_flush_invalidations(lupine_dedup_server_cache *c,
     }
   }
 
+  // Drain the shared additions log: read any new entries appended by
+  // other forked processes since our last drain. These are hashes that
+  // were newly cached by other children — our client's mirror should
+  // learn about them so future uploads get DEDUP_REF HITs.
+  if (impl->additions_log_fd >= 0) {
+    for (;;) {
+      lupine_dedup_hash128 h;
+      ssize_t n = pread(impl->additions_log_fd, h.bytes,
+                        sizeof(h.bytes), impl->additions_log_offset);
+      if (n != sizeof(h.bytes)) break;  // no more entries
+      impl->additions_log_offset += n;
+      std::lock_guard<std::mutex> lock(impl->mutex);
+      impl->pending_additions.push_back(h);
+    }
+  }
+
+  // Also drain S3 additions (new hashes from S3 manifest refreshes).
+  if (lupine_dedup_s3_available()) {
+    lupine_dedup_s3_drain_additions(&impl->pending_additions);
+  }
+
   // Swap pending invalidations into send_buffer. The send_buffer and
   // send_count live in the cache struct (which lives as long as the
   // connection), so the pointers pushed onto the write queue by rpc_write
@@ -534,15 +608,62 @@ int lupine_dedup_server_flush_invalidations(lupine_dedup_server_cache *c,
     std::lock_guard<std::mutex> lock(impl->mutex);
     impl->send_buffer.swap(impl->pending_invalidations);
     impl->send_count = static_cast<uint32_t>(impl->send_buffer.size());
+
+    // Cap additions at 4096 per response to bound the prefix size.
+    // Remaining additions stay in pending_additions for next response.
+    size_t add_to_send = std::min(impl->pending_additions.size(),
+                                   static_cast<size_t>(4096));
+    impl->additions_send_buffer.assign(
+        impl->pending_additions.begin(),
+        impl->pending_additions.begin() + add_to_send);
+    impl->pending_additions.erase(
+        impl->pending_additions.begin(),
+        impl->pending_additions.begin() + add_to_send);
+    impl->additions_send_count =
+        static_cast<uint32_t>(impl->additions_send_buffer.size());
   }
-  if (rpc_write(conn, &impl->send_count, sizeof(impl->send_count)) < 0)
+
+  // Build the inv_count word. If there are additions, set bit 31 to
+  // signal "additions follow after the invalidations."
+  uint32_t inv_count = impl->send_count;
+  bool has_additions = impl->additions_send_count > 0;
+  if (has_additions) {
+    inv_count |= 0x80000000u;
+  }
+
+  // Write [inv_count]
+  if (rpc_write(conn, &inv_count, sizeof(inv_count)) < 0)
     return -1;
+
+  // Write [inv_count × 16-byte hashes]
   if (impl->send_count > 0) {
     if (rpc_write(conn, impl->send_buffer.data(),
                   impl->send_count * sizeof(lupine_dedup_hash128)) < 0)
       return -1;
   }
+
+  // Write [add_count][add × 16-byte hashes] (only if bit 31 was set)
+  if (has_additions) {
+    if (rpc_write(conn, &impl->additions_send_count,
+                  sizeof(impl->additions_send_count)) < 0)
+      return -1;
+    if (impl->additions_send_count > 0) {
+      if (rpc_write(conn, impl->additions_send_buffer.data(),
+                    impl->additions_send_count *
+                        sizeof(lupine_dedup_hash128)) < 0)
+        return -1;
+    }
+  }
+
   return 0;
+}
+
+// Called after a successful local-disk insert to append the hash to the
+// shared additions.log so other forked children (and their clients) learn
+// about the new cache entry.
+void lupine_dedup_server_append_addition(const lupine_dedup_hash128 &hash) {
+  std::string cache_dir = lupine_dedup_cache_dir();
+  append_addition_log(cache_dir, hash);
 }
 
 // ---------------------------------------------------------------------------
@@ -817,6 +938,9 @@ void lupine_dedup_conn_init(conn_t *conn, int is_server) {
   if (is_server) {
     conn->dedup_server_cache = lupine_dedup_server_create(
         lupine_dedup_server_byte_cap_default());
+    // Initialize S3 L2 if configured. Starts background threads and loads
+    // the manifest. No-op if LUPINE_DEDUP_S3_BUCKET is not set.
+    lupine_dedup_s3_init();
   } else {
     conn->dedup_client_cache = lupine_dedup_client_create();
   }
@@ -930,6 +1054,8 @@ void lupine_dedup_conn_destroy(conn_t *conn) {
     lupine_dedup_server_destroy(static_cast<lupine_dedup_server_cache *>(
         conn->dedup_server_cache));
     conn->dedup_server_cache = nullptr;
+    // Shut down S3 L2 background threads. No-op if S3 was not configured.
+    lupine_dedup_s3_destroy();
   }
   if (conn->dedup_client_cache != nullptr) {
     lupine_dedup_client_destroy(static_cast<lupine_dedup_client_cache *>(
@@ -939,17 +1065,40 @@ void lupine_dedup_conn_destroy(conn_t *conn) {
 }
 
 int lupine_dedup_read_invalidations(conn_t *conn) {
-  // Read the dedup invalidations prefix that the server wrote at the start
-  // of the response. The prefix is [u32 count][count * 16 bytes of hashes].
-  // count == 0 is the common case. count == 0xFFFFFFFF is a future
-  // "clear-all" marker.
+  // Read the dedup prefix that the server wrote at the start of the response.
+  //
+  // Format:
+  //   [u32 inv_count] [inv_count × 16-byte hashes]            (no additions)
+  //   [u32 inv_count | 0x80000000] [inv × 16] [u32 add_count] [add × 16]  (with additions)
+  //
+  // inv_count == 0: no invalidations (common case).
+  // inv_count == 0xFFFFFFFF: clear-all marker (all bits set, checked first).
+  // Bit 31 set (but not all bits): additions follow after the invalidations.
+  auto *mirror = static_cast<lupine_dedup_client_cache *>(
+      conn->dedup_client_cache);
+
   uint32_t inv_count = 0;
   if (rpc_http2_read(conn, &inv_count, sizeof(inv_count)) != sizeof(inv_count)) {
     return -1;
   }
-  if (inv_count != 0 && inv_count != 0xFFFFFFFFu) {
-    if (inv_count > (64u * 1024u)) {
-      // Sanity bound: 64K entries * 16 bytes = 1 MiB.
+
+  // Check for clear-all marker first (0xFFFFFFFF has bit 31 set, so we
+  // must check it before the bit-31 additions test).
+  if (inv_count == 0xFFFFFFFFu) {
+    if (mirror != nullptr) {
+      lupine_dedup_client_clear(mirror);
+    }
+    return 0;
+  }
+
+  // Check if additions follow (bit 31 set).
+  bool has_additions = (inv_count & 0x80000000u) != 0;
+  inv_count &= 0x7FFFFFFFu;
+
+  // Read invalidations.
+  if (inv_count > 0) {
+    if (inv_count > (256u * 1024u * 1024u)) {
+      // Sanity bound: 256M entries = 4 GiB of hashes.
       return -1;
     }
     std::vector<lupine_dedup_hash128> invs(inv_count);
@@ -958,18 +1107,35 @@ int lupine_dedup_read_invalidations(conn_t *conn) {
     if (read_result < 0 || static_cast<size_t>(read_result) != inv_bytes) {
       return -1;
     }
-    auto *mirror = static_cast<lupine_dedup_client_cache *>(
-        conn->dedup_client_cache);
     if (mirror != nullptr) {
       lupine_dedup_client_invalidate(mirror, invs.data(), inv_count);
     }
-  } else if (inv_count == 0xFFFFFFFFu) {
-    auto *mirror = static_cast<lupine_dedup_client_cache *>(
-        conn->dedup_client_cache);
-    if (mirror != nullptr) {
-      lupine_dedup_client_clear(mirror);
+  }
+
+  // Read additions (if bit 31 was set).
+  if (has_additions) {
+    uint32_t add_count = 0;
+    if (rpc_http2_read(conn, &add_count, sizeof(add_count)) != sizeof(add_count)) {
+      return -1;
+    }
+    if (add_count > 0) {
+      if (add_count > (256u * 1024u * 1024u)) {
+        return -1;
+      }
+      std::vector<lupine_dedup_hash128> adds(add_count);
+      size_t add_bytes = add_count * sizeof(lupine_dedup_hash128);
+      int read_result = rpc_http2_read(conn, adds.data(), add_bytes);
+      if (read_result < 0 || static_cast<size_t>(read_result) != add_bytes) {
+        return -1;
+      }
+      if (mirror != nullptr) {
+        for (uint32_t i = 0; i < add_count; ++i) {
+          lupine_dedup_client_add(mirror, adds[i]);
+        }
+      }
     }
   }
+
   return 0;
 }
 

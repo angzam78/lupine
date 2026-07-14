@@ -11,7 +11,10 @@ set(MIN_CUDA_VERSION 11.0)
 find_package(CUDAToolkit REQUIRED)
 find_path(NGHTTP2_INCLUDE_DIR nghttp2/nghttp2.h REQUIRED)
 find_library(NGHTTP2_LIBRARY nghttp2 REQUIRED)
-# The server stays plaintext (front it with a TLS proxy); only the client links OpenSSL.
+# The server stays plaintext for its RPC port (front it with a TLS proxy),
+# but the dedup S3 L2 client needs OpenSSL for TLS to S3-compatible storage
+# and for SigV4 signing (SHA-256, HMAC-SHA256). The client also needs OpenSSL
+# for https:// connections to Lupine servers. So we link OpenSSL on all targets.
 find_package(OpenSSL QUIET)
 
 if (NOT CUDAToolkit_VERSION)
@@ -66,6 +69,7 @@ set(CLIENT_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/rpc.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/compress.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/dedup.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/dedup_s3.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cache.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/client.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/routing.cpp
@@ -83,6 +87,7 @@ set(SERVER_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/rpc.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/compress.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/dedup.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/dedup_s3.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/codegen/gen_server.cpp
 )
 
@@ -91,6 +96,7 @@ set(NVML_CLIENT_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/rpc.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/compress.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/dedup.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/dedup_s3.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/nvml_client.cpp
 )
 
@@ -99,6 +105,7 @@ set(CLIENT_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/client_routing.h
     ${CMAKE_CURRENT_SOURCE_DIR}/codegen/gen_client.h
     ${CMAKE_CURRENT_SOURCE_DIR}/dedup.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/dedup_s3.h
     ${CMAKE_CURRENT_SOURCE_DIR}/memcpy.h
     ${CMAKE_CURRENT_SOURCE_DIR}/copy_pipeline.h
 )
@@ -106,6 +113,7 @@ set(CLIENT_HEADERS
 set(SERVER_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/codegen/gen_server.h
     ${CMAKE_CURRENT_SOURCE_DIR}/dedup.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/dedup_s3.h
     ${CMAKE_CURRENT_SOURCE_DIR}/lupine_platform.h
     ${CMAKE_CURRENT_SOURCE_DIR}/manual_server.h
     ${CMAKE_CURRENT_SOURCE_DIR}/copy_pipeline.h
@@ -158,6 +166,10 @@ add_executable(${SERVER_OUTPUT} ${SERVER_SOURCES} ${SERVER_HEADERS})
 target_include_directories(${SERVER_OUTPUT} PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
 target_compile_definitions(${SERVER_OUTPUT} PRIVATE LUPINE_RPC_SERVER)
 target_link_libraries(${SERVER_OUTPUT} PRIVATE CUDA::cuda_driver ${NGHTTP2_LIBRARY} lupine_lz4 lupine_xxhash)
+if(OpenSSL_FOUND)
+    target_compile_definitions(${SERVER_OUTPUT} PRIVATE LUPINE_TLS_OPENSSL)
+    target_link_libraries(${SERVER_OUTPUT} PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+endif()
 
 if (WIN32)
     target_link_libraries(${SERVER_OUTPUT} PRIVATE ws2_32)
@@ -169,9 +181,14 @@ else()
         ${CMAKE_CURRENT_SOURCE_DIR}/rpc.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/compress.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/dedup.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/dedup_s3.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/h2_test.cpp
     )
     target_link_libraries(h2_test PRIVATE stdc++ ${NGHTTP2_LIBRARY} lupine_lz4 lupine_xxhash pthread)
+    if(OpenSSL_FOUND)
+        target_compile_definitions(h2_test PRIVATE LUPINE_TLS_OPENSSL)
+        target_link_libraries(h2_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    endif()
 
     enable_testing()
     add_test(NAME h2_test COMMAND h2_test)
