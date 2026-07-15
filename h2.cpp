@@ -1,5 +1,6 @@
 #include "lupine_log.h"
 #include "rpc.h"
+#include "dedup.h"
 
 #include <algorithm>
 #include <array>

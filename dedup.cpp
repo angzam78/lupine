@@ -21,6 +21,7 @@
 #include "codegen/gen_api.h"  // LUPINE_RPC_lupineDedupHashList
 
 #include <algorithm>
+#include <csignal>
 #include <cstring>
 #include <cstdlib>
 #include <dirent.h>
@@ -1079,6 +1080,7 @@ void lupine_dedup_conn_destroy(conn_t *conn) {
 }
 
 int lupine_dedup_read_invalidations(conn_t *conn) {
+  if (conn == nullptr || conn->dedup_client_cache == nullptr) return 0;
   // Read the dedup prefix that the server wrote at the start of the response.
   //
   // Format:
@@ -1154,7 +1156,59 @@ int lupine_dedup_read_invalidations(conn_t *conn) {
 }
 
 int lupine_dedup_flush_for_response(conn_t *conn) {
+  if (conn == nullptr || conn->dedup_server_cache == nullptr) return 0;
   auto *cache = static_cast<lupine_dedup_server_cache *>(
       conn->dedup_server_cache);
   return lupine_dedup_server_flush_invalidations(cache, conn);
+}
+
+// ---------------------------------------------------------------------------
+// Server lifecycle hooks (called from server.cpp)
+// ---------------------------------------------------------------------------
+
+// SIGTERM handler: closes the client socket to unblock the dispatch loop,
+// allowing normal cleanup (including S3 queue drain) to run.
+static lupine_socket_t g_sigterm_connfd = LUPINE_INVALID_SOCKET;
+static void dedup_sigterm_handler(int sig) {
+  (void)sig;
+  if (g_sigterm_connfd != LUPINE_INVALID_SOCKET) {
+    lupine_socket_close(g_sigterm_connfd);
+    g_sigterm_connfd = LUPINE_INVALID_SOCKET;
+  }
+}
+
+void lupine_dedup_install_sigterm_handler(lupine_socket_t connfd) {
+  if (!lupine_dedup_enabled_globally()) return;
+  g_sigterm_connfd = connfd;
+  signal(SIGTERM, dedup_sigterm_handler);
+}
+
+// Server-side RPC handler for lupineDedupHashList. Scans L1 disk cache
+// and L2 S3 manifest, sends the union of hashes to the client.
+int handle_manual_lupineDedupHashList(conn_t *conn) {
+  int request_id = rpc_read_end(conn);
+  if (request_id < 0) {
+    return -1;
+  }
+
+  std::vector<lupine_dedup_hash128> hashes;
+  auto *cache = static_cast<lupine_dedup_server_cache *>(
+      conn->dedup_server_cache);
+  if (cache != nullptr) {
+    lupine_dedup_server_scan_hashes(cache, &hashes);
+  }
+
+  if (lupine_dedup_s3_configured()) {
+    lupine_dedup_s3_scan_hashes(&hashes);
+  }
+
+  uint32_t count = static_cast<uint32_t>(hashes.size());
+  if (rpc_write_start_response(conn, request_id) < 0 ||
+      rpc_write(conn, &count, sizeof(count)) < 0 ||
+      (count > 0 && rpc_write(conn, hashes.data(),
+                              count * sizeof(lupine_dedup_hash128)) < 0) ||
+      rpc_write_end(conn) < 0) {
+    return -1;
+  }
+  return 0;
 }

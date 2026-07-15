@@ -7,8 +7,6 @@
 #include <stdint.h>
 #include <vector>
 
-#include "dedup.h"
-
 // Uncompressed block size for the optional LZ4 payload framing. The framed
 // bytes are produced lazily, one block at a time, by the HTTP/2 transport
 // (h2.cpp) and decoded by the rpc_read_payload helpers (compress.cpp).

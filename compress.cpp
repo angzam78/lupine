@@ -27,6 +27,7 @@
 // side mirrors this with a single compressed-block scratch buffer.
 
 #include "rpc.h"
+#include "dedup.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -60,9 +61,7 @@ int rpc_write_payload(conn_t *conn, const void *data, size_t size) {
   if (!lupine_payload_framed(conn, size)) {
     return rpc_write(conn, data, size);
   }
-  if (lupine_dedup_enabled(conn)) {
-    return lupine_dedup_write_payload(conn, data, size);
-  }
+  if (lupine_dedup_enabled(conn)) return lupine_dedup_write_payload(conn, data, size);
   return rpc_write_framed(conn, data, size);
 }
 
@@ -78,9 +77,7 @@ int rpc_read_payload_part(conn_t *conn, int framed, void *data, size_t size) {
   if (!framed) {
     return rpc_read(conn, data, size);
   }
-  if (lupine_dedup_enabled(conn)) {
-    return lupine_dedup_read_payload_part(conn, data, size);
-  }
+  if (lupine_dedup_enabled(conn)) return lupine_dedup_read_payload_part(conn, data, size);
 
   auto *dst = static_cast<char *>(data);
   size_t remaining = size;
@@ -136,9 +133,7 @@ int rpc_drain_payload(conn_t *conn, int framed, size_t size) {
   if (!framed) {
     return rpc_drain(conn, size);
   }
-  if (lupine_dedup_enabled(conn)) {
-    return lupine_dedup_drain_payload(conn, size);
-  }
+  if (lupine_dedup_enabled(conn)) return lupine_dedup_drain_payload(conn, size);
   size_t remaining = size;
   while (remaining > 0) {
     size_t raw = std::min(kLupineCompressBlockBytes, remaining);

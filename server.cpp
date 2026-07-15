@@ -19,6 +19,7 @@
 #include "codegen/gen_api.h"
 #include "codegen/gen_server.h"
 #include "copy_pipeline.h"
+#include "dedup.h"
 #include "lupine_log.h"
 #include "manual_server.h"
 #include "rpc.h"
@@ -239,21 +240,8 @@ struct lupine_lane {
   std::thread worker;
 };
 
-// SIGTERM handler for forked children: closes the client socket to unblock
-// the dispatch loop, allowing graceful cleanup (including S3 queue drain).
-static lupine_socket_t g_active_connfd = LUPINE_INVALID_SOCKET;
-static void sigterm_handler(int sig) {
-  (void)sig;
-  if (g_active_connfd != LUPINE_INVALID_SOCKET) {
-    lupine_socket_close(g_active_connfd);
-    g_active_connfd = LUPINE_INVALID_SOCKET;
-  }
-}
-
 void client_handler(lupine_socket_t connfd) {
-  // Install SIGTERM handler so graceful cleanup (S3 queue drain) runs
-  g_active_connfd = connfd;
-  signal(SIGTERM, sigterm_handler);
+  lupine_dedup_install_sigterm_handler(connfd);
   conn_t conn = {};
   conn.connfd = connfd;
   conn.request_id = 1;
@@ -276,7 +264,7 @@ void client_handler(lupine_socket_t connfd) {
   LUPINE_LOG_DEBUG("Client connected.");
 
   std::unordered_map<uint64_t, std::shared_ptr<lupine_lane>> lanes;
-  while (!conn.closed && !g_sigterm_received) {
+  while (!conn.closed) {
     if (pthread_mutex_lock(&conn.read_mutex) != 0) {
       break;
     }
