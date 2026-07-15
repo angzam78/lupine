@@ -1182,6 +1182,10 @@ def main():
             write_rpc_define(f"RPC_{name}", name)
         f.write("\n")
         for name in PRIVATE_RPC_FUNCTIONS:
+            # Skip if already emitted as a regular RPC (e.g. cuMemPrefetchAsync
+            # exists in both the CUDA header and PRIVATE_RPC_FUNCTIONS on CUDA 12.x)
+            if f"RPC_{name}" in emitted_macros:
+                continue
             write_rpc_define(f"LUPINE_RPC_{name}", name)
 
     with open("gen_nvml_client.inc", "w") as f:
