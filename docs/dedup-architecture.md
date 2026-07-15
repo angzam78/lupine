@@ -34,9 +34,9 @@ The first model load uploads all chunks to the server's L1 disk cache. The secon
 **Server:**
 ```bash
 LUPINE_DEDUP=1 \
-LUPINE_DEDUP_S3_ENDPOINT=s3.eu-central-003.backblazeb2.com \
+LUPINE_DEDUP_S3_ENDPOINT=s3.example.com \
 LUPINE_DEDUP_S3_BUCKET=my-lupine-cache \
-LUPINE_DEDUP_S3_REGION=eu-central-003 \
+LUPINE_DEDUP_S3_REGION=us-east-1 \
 LUPINE_DEDUP_S3_ACCESS_KEY=... \
 LUPINE_DEDUP_S3_SECRET_KEY=... \
 LUPINE_DEDUP_S3_PATH_STYLE=1 \
@@ -538,20 +538,20 @@ All S3 env vars are optional. S3 L2 is enabled when `LUPINE_DEDUP_S3_BUCKET` is 
 | Env var | Default | Purpose |
 |---------|---------|---------|
 | `LUPINE_DEDUP_S3_BUCKET` | unset | S3 bucket name. Setting this enables the L2 cache. |
-| `LUPINE_DEDUP_S3_ENDPOINT` | (required) | S3 endpoint hostname, e.g. `s3.eu-central-003.backblazeb2.com`. Optional `https://` prefix (default) or `http://` (no TLS). |
-| `LUPINE_DEDUP_S3_REGION` | (required) | S3 region, e.g. `eu-central-003`. |
+| `LUPINE_DEDUP_S3_ENDPOINT` | (required) | S3 endpoint hostname, e.g. `s3.example.com`. Optional `https://` prefix (default) or `http://` (no TLS). |
+| `LUPINE_DEDUP_S3_REGION` | (required) | S3 region, e.g. `us-east-1`. |
 | `LUPINE_DEDUP_S3_ACCESS_KEY` | (required) | S3 access key ID. |
 | `LUPINE_DEDUP_S3_SECRET_KEY` | (required) | S3 secret access key. |
 | `LUPINE_DEDUP_S3_PREFIX` | unset | Optional key prefix within the bucket (for multi-tenant bucket sharing). |
 | `LUPINE_DEDUP_S3_PATH_STYLE` | `1` (on) | `1` = path-style URLs (`/bucket/key`, B2/MinIO). `0` = virtual-host-style (`bucket.s3.amazonaws.com/key`, AWS S3). |
 | `LUPINE_DEDUP_S3_CACHE_BYTES` | `0` (unlimited) | L2 cache cap in bytes. When set, `lupine_dedup_s3_cleanup` evicts oldest objects to stay under this cap. |
 
-**Example (B2 with Cloudflare proxy):**
+**Example:**
 ```bash
 LUPINE_DEDUP=1 \
-LUPINE_DEDUP_S3_ENDPOINT=s3.eu-central-003.backblazeb2.com \
+LUPINE_DEDUP_S3_ENDPOINT=s3.example.com \
 LUPINE_DEDUP_S3_BUCKET=my-lupine-cache \
-LUPINE_DEDUP_S3_REGION=eu-central-003 \
+LUPINE_DEDUP_S3_REGION=us-east-1 \
 LUPINE_DEDUP_S3_ACCESS_KEY=... \
 LUPINE_DEDUP_S3_SECRET_KEY=... \
 LUPINE_DEDUP_S3_PATH_STYLE=1 \
