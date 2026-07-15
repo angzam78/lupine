@@ -14,9 +14,6 @@ find_library(NGHTTP2_LIBRARY nghttp2 REQUIRED)
 # The server stays plaintext (front it with a TLS proxy); only the client links OpenSSL.
 find_package(OpenSSL QUIET)
 
-# Dedup feature: xxHash, OpenSSL, libcurl, dedup.cpp/dedup_s3.cpp
-include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/dedup.cmake)
-
 if (NOT CUDAToolkit_VERSION)
     message(FATAL_ERROR "CUDA Toolkit is required but not found.")
 endif()
@@ -101,6 +98,10 @@ set(SERVER_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/nvml_server.h
     ${CMAKE_CURRENT_SOURCE_DIR}/rpc.h
 )
+
+# Dedup feature: xxHash, OpenSSL, libcurl, dedup.cpp/dedup_s3.cpp
+# Must be included AFTER the source/header lists above so list(APPEND) works.
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/dedup.cmake)
 
 set(CLIENT_OUTPUT lupine_driver)
 set(NVML_CLIENT_OUTPUT lupine_nvml)
