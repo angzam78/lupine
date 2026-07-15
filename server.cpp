@@ -240,8 +240,20 @@ struct lupine_lane {
   std::thread worker;
 };
 
+// SIGTERM handler for forked children: closes the client socket to unblock
+// the dispatch loop, allowing graceful cleanup (including S3 queue drain).
+static lupine_socket_t g_active_connfd = LUPINE_INVALID_SOCKET;
+static void sigterm_handler(int sig) {
+  (void)sig;
+  if (g_active_connfd != LUPINE_INVALID_SOCKET) {
+    lupine_socket_close(g_active_connfd);
+    g_active_connfd = LUPINE_INVALID_SOCKET;
+  }
+}
+
 void client_handler(lupine_socket_t connfd) {
-  lupine_dedup_install_sigterm_handler(connfd);
+  g_active_connfd = connfd;
+  signal(SIGTERM, sigterm_handler);
   conn_t conn = {};
   conn.connfd = connfd;
   conn.request_id = 1;

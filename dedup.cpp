@@ -21,7 +21,6 @@
 #include "codegen/gen_api.h"  // LUPINE_RPC_lupineDedupHashList
 
 #include <algorithm>
-#include <csignal>
 #include <cstring>
 #include <cstdlib>
 #include <dirent.h>
@@ -1163,25 +1162,8 @@ int lupine_dedup_flush_for_response(conn_t *conn) {
 }
 
 // ---------------------------------------------------------------------------
-// Server lifecycle hooks (called from server.cpp)
+// Server-side RPC handler (called from server.cpp's handler map)
 // ---------------------------------------------------------------------------
-
-// SIGTERM handler: closes the client socket to unblock the dispatch loop,
-// allowing normal cleanup (including S3 queue drain) to run.
-static lupine_socket_t g_sigterm_connfd = LUPINE_INVALID_SOCKET;
-static void dedup_sigterm_handler(int sig) {
-  (void)sig;
-  if (g_sigterm_connfd != LUPINE_INVALID_SOCKET) {
-    lupine_socket_close(g_sigterm_connfd);
-    g_sigterm_connfd = LUPINE_INVALID_SOCKET;
-  }
-}
-
-void lupine_dedup_install_sigterm_handler(lupine_socket_t connfd) {
-  if (!lupine_dedup_enabled_globally()) return;
-  g_sigterm_connfd = connfd;
-  signal(SIGTERM, dedup_sigterm_handler);
-}
 
 // Server-side RPC handler for lupineDedupHashList. Scans L1 disk cache
 // and L2 S3 manifest, sends the union of hashes to the client.

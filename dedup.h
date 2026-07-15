@@ -28,10 +28,6 @@
 
 struct conn_t;
 
-// Forward-declare lupine_socket_t (defined in lupine_platform.h, included
-// indirectly via rpc.h in .cpp files). Used by lupine_dedup_install_sigterm_handler.
-typedef int lupine_socket_t;
-
 // 128-bit content hash for a chunk.
 struct lupine_dedup_hash128 {
     uint8_t bytes[16];
@@ -249,16 +245,6 @@ int lupine_dedup_flush_for_response(conn_t *conn);
 // that this chunk is now cached.
 void lupine_dedup_server_append_addition(
     const lupine_dedup_hash128 &hash);
-
-// ---------------------------------------------------------------------------
-// Server lifecycle hooks (called from server.cpp)
-// ---------------------------------------------------------------------------
-
-// Installs a SIGTERM handler for the forked child. On SIGTERM, the handler
-// closes the client socket (unblocking the dispatch loop) so that normal
-// cleanup runs — including lupine_dedup_s3_destroy which drains the S3
-// write queue. No-op if LUPINE_DEDUP is not set.
-void lupine_dedup_install_sigterm_handler(lupine_socket_t connfd);
 
 // Server-side RPC handler for lupineDedupHashList. Scans the L1 disk cache
 // and the L2 S3 manifest, sends the union of hashes to the client so it can
