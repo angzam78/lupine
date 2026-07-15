@@ -8,6 +8,70 @@
 
 ---
 
+## 0. Quick start
+
+### L1 disk cache only (no S3)
+
+**Server:**
+```bash
+LUPINE_DEDUP=1 ./build/lupine_driver_server
+```
+
+**Client:**
+```bash
+LUPINE_DEDUP=1 \
+LUPINE_SERVER=<host>:14833 \
+LUPINE_DISABLE_LOCAL=1 \
+LD_PRELOAD=/path/to/build/libcuda.so.1 \
+LD_LIBRARY_PATH=/path/to/build:/usr/local/cuda/lib64 \
+  python3 your_app.py
+```
+
+The first model load uploads all chunks to the server's L1 disk cache. The second load (same or different client) gets HITs — each 4 MiB chunk is replaced by a 20-byte hash reference on the wire.
+
+### L1 + S3 L2 cache
+
+**Server:**
+```bash
+LUPINE_DEDUP=1 \
+LUPINE_DEDUP_S3_ENDPOINT=s3.eu-central-003.backblazeb2.com \
+LUPINE_DEDUP_S3_BUCKET=my-lupine-cache \
+LUPINE_DEDUP_S3_REGION=eu-central-003 \
+LUPINE_DEDUP_S3_ACCESS_KEY=... \
+LUPINE_DEDUP_S3_SECRET_KEY=... \
+LUPINE_DEDUP_S3_PATH_STYLE=1 \
+  ./build/lupine_driver_server
+```
+
+**Client:** same as L1-only — the client doesn't know about S3.
+
+S3 L2 is optional and best-effort. If S3 is unavailable, the server operates as L1-only. When S3 is available, chunks are async-replicated to S3, and on L1 miss the server fetches from S3 (promoting the chunk back to L1). Multiple servers sharing the same S3 bucket share the L2 cache.
+
+### Graceful shutdown
+
+```bash
+# Use SIGTERM (not SIGKILL) so the S3 write queue drains:
+kill -TERM <server_pid>
+# The server waits up to 120s for pending S3 uploads to complete,
+# then flushes the manifest and exits.
+```
+
+### Building
+
+No special build flags needed — the dedup code is always compiled. The `LUPINE_DEDUP=1` env var controls whether it's active at runtime. S3 L2 requires `libcurl-dev` and `libssl-dev` (already needed by the client for TLS).
+
+```bash
+# Standard build (works with or without dedup):
+python3 codegen/codegen.py
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
+
+# Run unit tests:
+LUPINE_DEDUP=1 ./build/h2_test
+```
+
+---
+
 ## 1. Overview
 
 Lupine's client shim re-sends every byte of every `cuMemcpyHtoD*` call to the server, even when the same bytes were sent seconds ago — by the same client or by a different client. The dedup feature adds a **two-tier, content-addressed chunk cache** that replaces repeated chunk transfers with a 20-byte hash reference.
