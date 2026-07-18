@@ -2191,8 +2191,7 @@ CUresult cuCtxCreate_v2(CUcontext *pctx, unsigned int flags, CUdevice dev);
 CUresult cuCtxCreate_v3(CUcontext *pctx, CUexecAffinityParam *paramsArray,
                         int numParams, unsigned int flags, CUdevice dev);
 /**
- * @disabled client - manual client hooks lupine_handle_context_destroyed for
- * OPT-1 edge case
+ * @disabled client - manual client hooks lupine_handle_context_destroyed for OPT-1 edge case
  * @disabled server - manual server coordinates retained staging lifecycle
  * @param ctx SEND_ONLY
  */
@@ -3640,8 +3639,7 @@ CUresult cuStreamBatchMemOp_v2(CUstream stream, unsigned int count,
                                CUstreamBatchMemOpParams *paramArray,
                                unsigned int flags);
 /**
- * @disabled client - manual client routes through
- * lupine_cuFuncGetAttribute_cached (OPT-2)
+ * @disabled client - manual client routes through lupine_cuFuncGetAttribute_cached (OPT-2)
  * @routingkey FUNCTION hfunc
  * @param pi SEND_RECV
  * @param attrib SEND_ONLY
@@ -3650,8 +3648,7 @@ CUresult cuStreamBatchMemOp_v2(CUstream stream, unsigned int count,
 CUresult cuFuncGetAttribute(int *pi, CUfunction_attribute attrib,
                             CUfunction hfunc);
 /**
- * @disabled client - manual client routes through
- * lupine_cuFuncSetAttribute_cached (OPT-3)
+ * @disabled client - manual client routes through lupine_cuFuncSetAttribute_cached (OPT-3)
  * @routingkey FUNCTION hfunc
  * @param hfunc SEND_ONLY
  * @param attrib SEND_ONLY
