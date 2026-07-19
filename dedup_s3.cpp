@@ -920,6 +920,14 @@ write_queue &get_write_queue() {
   return q;
 }
 
+// Number of S3 PUTs currently in flight (dequeued but not yet completed).
+// Incremented when a worker pops an entry off the queue, decremented after
+// the transfer completes (success OR failure) and the manifest has been
+// updated. lupine_dedup_s3_destroy waits for this to hit zero before
+// flushing the manifest, so that every chunk that finished uploading
+// within the drain window is captured in the final manifest write.
+std::atomic<size_t> g_active_puts{0};
+
 // Number of parallel S3 upload workers. Each worker has its own persistent
 // HTTP/2 connection, so N workers = N concurrent S3 PUTs.
 constexpr int S3_WRITE_WORKER_COUNT = 8;
@@ -964,13 +972,24 @@ void write_through_worker() {
         if (get_write_queue().entries.empty()) continue;
         entry = std::move(get_write_queue().entries.front());
         get_write_queue().entries.pop_front();
+        // Track this transfer as in-flight. lupine_dedup_s3_destroy waits
+        // for g_active_puts to hit zero before flushing the manifest, so
+        // every chunk that finishes uploading within the drain window is
+        // captured in the final manifest write.
+        g_active_puts.fetch_add(1);
       }
 
       // Build and submit the PUT
       auto mt = std::make_unique<multi_transfer>();
       mt->entry = std::move(entry);
       mt->easy = curl_easy_init();
-      if (!mt->easy) continue;
+      if (!mt->easy) {
+        // No transfer was started — release the in-flight slot we took
+        // when dequeuing, otherwise the drain in destroy() would wait
+        // forever for a PUT that never happens.
+        g_active_puts.fetch_sub(1);
+        continue;
+      }
 
       std::string host, path;
       s3_build_host_path(cfg, hash_to_s3_key(mt->entry.hash), host, path);
@@ -1074,6 +1093,12 @@ void write_through_worker() {
             } else {
               LUPINE_LOG_ERROR("S3 PUT failed");
             }
+            // Transfer complete (success or failure). Release the in-flight
+            // slot so lupine_dedup_s3_destroy's drain can observe that this
+            // PUT is no longer pending. On the success path, the manifest
+            // has already been updated above under m.mutex, so the final
+            // manifest flush in destroy() will capture this chunk.
+            g_active_puts.fetch_sub(1);
             curl_multi_remove_handle(multi, easy);
             curl_easy_cleanup(easy);
             if (active[i]->hdrs) curl_slist_free_all(active[i]->hdrs);
@@ -1096,8 +1121,14 @@ void write_through_worker() {
     }
   }
 
-  // Cleanup any remaining transfers
+  // Cleanup any remaining transfers. These are PUTs that were in flight when
+  // the worker exited (only happens if shutdown was forced after the 120s
+  // drain cap in lupine_dedup_s3_destroy). They never completed, so they
+  // never hit the decrement path above — release their slots here so the
+  // counter doesn't leak. Their chunks are NOT in the manifest; on next
+  // server start they'll be re-uploaded as MISSes.
   for (auto &mt : active) {
+    g_active_puts.fetch_sub(1);
     curl_multi_remove_handle(multi, mt->easy);
     curl_easy_cleanup(mt->easy);
     if (mt->hdrs) curl_slist_free_all(mt->hdrs);
@@ -1164,43 +1195,79 @@ void lupine_dedup_s3_init() {
 void lupine_dedup_s3_destroy() {
   if (!lupine_dedup_s3_configured()) return;
 
-  // Wait for the write queue to drain before shutting down.
-  // This ensures all pending S3 PUTs complete and the manifest is current.
-  // Bounded to 120 seconds so a stuck connection doesn't block forever.
-  {
-    int wait_seconds = 0;
-    while (wait_seconds < 120) {
-      size_t remaining;
-      {
-        std::lock_guard<std::mutex> lock(get_write_queue().mutex);
-        remaining = get_write_queue().entries.size();
-      }
-      if (remaining == 0) break;
-      std::this_thread::sleep_for(std::chrono::seconds(1));
-      wait_seconds++;
-    }
-    if (wait_seconds >= 120) {
-      LUPINE_LOG_ERROR("S3 write queue did not drain in 120s, "
-                       "forcing shutdown");
-    }
-  }
-
-  // Signal shutdown
+  // Phase 1: Signal shutdown so workers stop dequeuing new entries.
+  // (Set this BEFORE draining so workers exit their fill loops immediately
+  // rather than picking up new work during the drain window.)
   {
     std::lock_guard<std::mutex> lock(get_write_queue().mutex);
     get_write_queue().shutdown = true;
   }
   get_write_queue().cv.notify_all();
 
-  // Flush manifest after queue is drained
-  if (g_s3_available.load()) {
+  // Phase 2: Wait for the write queue to drain AND all in-flight PUTs to
+  // complete. This ensures every chunk that finished uploading within the
+  // drain window has its hash recorded in the manifest before we flush it.
+  // Bounded to 120 seconds so a stuck transfer doesn't block shutdown
+  // forever; if we hit the cap, in-flight transfers are abandoned (their
+  // chunks will be re-uploaded as MISSes on next cold start).
+  bool drained_cleanly = false;
+  {
+    int wait_seconds = 0;
+    while (wait_seconds < 120) {
+      size_t remaining_entries;
+      {
+        std::lock_guard<std::mutex> lock(get_write_queue().mutex);
+        remaining_entries = get_write_queue().entries.size();
+      }
+      size_t remaining_active = g_active_puts.load();
+      if (remaining_entries == 0 && remaining_active == 0) {
+        drained_cleanly = true;
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+      wait_seconds++;
+    }
+  }
+  if (!drained_cleanly) {
+    size_t remaining_entries;
+    {
+      std::lock_guard<std::mutex> lock(get_write_queue().mutex);
+      remaining_entries = get_write_queue().entries.size();
+    }
+    size_t remaining_active = g_active_puts.load();
+    LUPINE_LOG_ERROR("S3 write queue did not drain in 120s, forcing shutdown ("
+                     << remaining_entries << " entries queued, "
+                     << remaining_active << " in-flight PUTs abandoned)");
+  }
+
+  // Phase 3: Join or detach workers.
+  // If the drain completed cleanly, workers are guaranteed to exit quickly
+  // (their active transfers are empty and shutdown is set, so they break
+  // out of their loops). If we hit the 120s cap, workers may still be
+  // driving stuck transfers — detach them so we don't block forever; the
+  // process will exit and kill the threads.
+  for (auto &t : g_write_threads) {
+    if (t.joinable()) {
+      if (drained_cleanly) {
+        t.join();
+      } else {
+        t.detach();
+      }
+    }
+  }
+  g_write_threads.clear();
+
+  // Phase 4: Stop the manifest flush loop from racing with our final write,
+  // then flush the manifest one last time. This captures every chunk whose
+  // PUT completed within the drain window. Must happen AFTER worker join
+  // (if clean) so no worker is updating m.entries concurrently.
+  bool s3_was_available = g_s3_available.exchange(0);
+  if (s3_was_available) {
     write_manifest_to_s3();
   }
 
-  // Detach threads (they'll exit when the child process exits)
-  for (auto &t : g_write_threads) {
-    if (t.joinable()) t.detach();
-  }
+  // Detach the background helper threads (they're no-ops now that
+  // g_s3_available is false, and the process is about to exit).
   if (g_availability_thread.joinable()) g_availability_thread.detach();
   if (g_flush_thread.joinable()) g_flush_thread.detach();
 }
