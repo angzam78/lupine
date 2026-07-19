@@ -290,35 +290,52 @@ struct lupine_device_attribute_key_hash {
   }
 };
 
-// LUPINE-OPT-2: cache for cuFuncGetAttribute — result is a pure function of
-// (function, attribute) and never changes for the lifetime of the CUfunction.
-struct lupine_function_attribute_key {
+// LUPINE-OPT-2 / OPT-3: shared key for cuFuncGetAttribute (OPT-2) and
+// cuFuncSetAttribute (OPT-3) caches. Both caches are keyed by (function,
+// attribute); the GET cache stores the queried result and the SET cache
+// stores the last-set value. Result of cuFuncGetAttribute is a pure
+// function of (function, attribute) for the immutable attributes; OPT-3
+// keeps OPT-2 in sync on every successful SET for the nine runtime-mutable
+// attributes (CACHE_MODE_CA, MAX_DYNAMIC_SHARED_SIZE_BYTES,
+// PREFERRED_SHARED_MEMORY_CARVEOUT, CLUSTER_SIZE_MUST_BE_SET,
+// REQUIRED_CLUSTER_WIDTH/HEIGHT/DEPTH, NON_PORTABLE_CLUSTER_SIZE_ALLOWED,
+// CLUSTER_SCHEDULING_POLICY_PREFERENCE).
+struct lupine_func_attr_key {
   uintptr_t function = 0;
   int attribute = 0;
-  bool operator==(const lupine_function_attribute_key &other) const {
+  bool operator==(const lupine_func_attr_key &other) const {
     return function == other.function && attribute == other.attribute;
   }
 };
-struct lupine_function_attribute_key_hash {
-  size_t operator()(const lupine_function_attribute_key &key) const {
+struct lupine_func_attr_key_hash {
+  size_t operator()(const lupine_func_attr_key &key) const {
     return static_cast<size_t>(key.function) ^
            (static_cast<size_t>(static_cast<unsigned int>(key.attribute)) << 1);
   }
 };
 
-// LUPINE-OPT-3: cache for cuFuncSetAttribute — setting (func, attr) to the
-// same value twice is a no-op, so we track the last-set value and skip the RPC.
-struct lupine_function_set_attr_key {
-  uintptr_t function = 0;
+// LUPINE-OPT-K2 / OPT-K3: shared key for cuKernelGetAttribute (OPT-K2) and
+// cuKernelSetAttribute (OPT-K3) caches. The dev field is required because
+// cuKernelGetAttribute is device-scoped — the same (kernel, attr) can
+// return different values on different devices for the mutable attributes.
+// The route_kernel field is the route-resolved CUkernel handle, NOT the
+// client-canonical handle — different servers mint distinct handles for
+// the same kernel.
+struct lupine_kernel_attr_key {
+  uintptr_t route_kernel = 0;
   int attribute = 0;
-  bool operator==(const lupine_function_set_attr_key &other) const {
-    return function == other.function && attribute == other.attribute;
+  int device = 0;
+  bool operator==(const lupine_kernel_attr_key &other) const {
+    return route_kernel == other.route_kernel && attribute == other.attribute &&
+           device == other.device;
   }
 };
-struct lupine_function_set_attr_key_hash {
-  size_t operator()(const lupine_function_set_attr_key &key) const {
-    return static_cast<size_t>(key.function) ^
-           (static_cast<size_t>(static_cast<unsigned int>(key.attribute)) << 1);
+struct lupine_kernel_attr_key_hash {
+  size_t operator()(const lupine_kernel_attr_key &key) const {
+    return static_cast<size_t>(key.route_kernel) ^
+           (static_cast<size_t>(static_cast<unsigned int>(key.attribute))
+            << 1) ^
+           (static_cast<size_t>(static_cast<unsigned int>(key.device)) << 17);
   }
 };
 
@@ -416,12 +433,11 @@ static std::mutex &lupine_device_attribute_cache_mutex() {
 }
 
 // LUPINE-OPT-2: cuFuncGetAttribute result cache.
-static std::unordered_map<lupine_function_attribute_key, int,
-                          lupine_function_attribute_key_hash> &
+static std::unordered_map<lupine_func_attr_key, int,
+                          lupine_func_attr_key_hash> &
 lupine_function_attribute_cache() {
-  static auto *cache =
-      new std::unordered_map<lupine_function_attribute_key, int,
-                             lupine_function_attribute_key_hash>();
+  static auto *cache = new std::unordered_map<lupine_func_attr_key, int,
+                                              lupine_func_attr_key_hash>();
   return *cache;
 }
 static std::mutex &lupine_function_attribute_cache_mutex() {
@@ -430,17 +446,69 @@ static std::mutex &lupine_function_attribute_cache_mutex() {
 }
 
 // LUPINE-OPT-3: cuFuncSetAttribute last-value cache.
-static std::unordered_map<lupine_function_set_attr_key, int,
-                          lupine_function_set_attr_key_hash> &
+static std::unordered_map<lupine_func_attr_key, int,
+                          lupine_func_attr_key_hash> &
 lupine_function_set_attr_cache() {
-  static auto *cache =
-      new std::unordered_map<lupine_function_set_attr_key, int,
-                             lupine_function_set_attr_key_hash>();
+  static auto *cache = new std::unordered_map<lupine_func_attr_key, int,
+                                              lupine_func_attr_key_hash>();
   return *cache;
 }
 static std::mutex &lupine_function_set_attr_cache_mutex() {
   static auto *mutex = new std::mutex();
   return *mutex;
+}
+
+// LUPINE-OPT-K2: cuKernelGetAttribute result cache.
+static std::unordered_map<lupine_kernel_attr_key, int,
+                          lupine_kernel_attr_key_hash> &
+lupine_kernel_attribute_cache() {
+  static auto *cache = new std::unordered_map<lupine_kernel_attr_key, int,
+                                              lupine_kernel_attr_key_hash>();
+  return *cache;
+}
+static std::mutex &lupine_kernel_attribute_cache_mutex() {
+  static auto *mutex = new std::mutex();
+  return *mutex;
+}
+
+// LUPINE-OPT-K3: cuKernelSetAttribute last-value cache.
+static std::unordered_map<lupine_kernel_attr_key, int,
+                          lupine_kernel_attr_key_hash> &
+lupine_kernel_set_attr_cache() {
+  static auto *cache = new std::unordered_map<lupine_kernel_attr_key, int,
+                                              lupine_kernel_attr_key_hash>();
+  return *cache;
+}
+static std::mutex &lupine_kernel_set_attr_cache_mutex() {
+  static auto *mutex = new std::mutex();
+  return *mutex;
+}
+
+// LUPINE-OPT-2/3/K2/K3: cache-clear helpers. Used by
+// lupine_invalidate_function_caches() on module/library unload, by
+// rpc_mark_connection_closed() on server reconnect, and by the SET wrappers
+// for cross-invalidation (a function SET clears the kernel caches wholesale;
+// a kernel SET clears the function caches wholesale — see OPT-3 / OPT-K3
+// rationale).
+static void lupine_clear_function_attr_caches() {
+  {
+    std::lock_guard<std::mutex> lock(lupine_function_attribute_cache_mutex());
+    lupine_function_attribute_cache().clear();
+  }
+  {
+    std::lock_guard<std::mutex> lock(lupine_function_set_attr_cache_mutex());
+    lupine_function_set_attr_cache().clear();
+  }
+}
+static void lupine_clear_kernel_attr_caches() {
+  {
+    std::lock_guard<std::mutex> lock(lupine_kernel_attribute_cache_mutex());
+    lupine_kernel_attribute_cache().clear();
+  }
+  {
+    std::lock_guard<std::mutex> lock(lupine_kernel_set_attr_cache_mutex());
+    lupine_kernel_set_attr_cache().clear();
+  }
 }
 
 static std::unordered_map<lupine_kernel_function_key, CUfunction,
@@ -3724,16 +3792,9 @@ static CUresult lupine_warm_kernel_param_info(CUkernel kernel) {
 }
 
 extern "C" void lupine_invalidate_function_caches() {
-  // LUPINE-OPT-2: clear the function-attribute cache too.
-  {
-    std::lock_guard<std::mutex> lock(lupine_function_attribute_cache_mutex());
-    lupine_function_attribute_cache().clear();
-  }
-  // LUPINE-OPT-3: clear the function-set-attribute cache too.
-  {
-    std::lock_guard<std::mutex> lock(lupine_function_set_attr_cache_mutex());
-    lupine_function_set_attr_cache().clear();
-  }
+  // LUPINE-OPT-2/3/K2/K3: clear all four attribute caches.
+  lupine_clear_function_attr_caches();
+  lupine_clear_kernel_attr_caches();
   {
     std::lock_guard<std::mutex> lock(lupine_param_info_cache_mutex());
     lupine_param_info_cache().clear();
@@ -4180,19 +4241,18 @@ extern "C" CUresult cuLaunchCooperativeKernel_ptsz(
 // LUPINE-OPT-2: cached wrapper for cuFuncGetAttribute. The result of
 // cuFuncGetAttribute(attr, func) is a pure function of (attr, func) for the
 // vast majority of attributes (MAX_THREADS_PER_BLOCK, SHARED_SIZE_BYTES,
-// CONST_SIZE_BYTES, LOCAL_SIZE_BYTES, NUM_REGS, ...). Two attributes are
-// runtime-mutable via cuFuncSetAttribute (MAX_DYNAMIC_SHARED_SIZE_BYTES,
-// PREFERRED_SHARED_MEMORY_CARVEOUT); OPT-3 keeps this cache in sync on every
-// successful SET, so the GET cache is always correct without time-based
-// invalidation.
+// CONST_SIZE_BYTES, LOCAL_SIZE_BYTES, NUM_REGS, ...). Nine attributes are
+// runtime-mutable via cuFuncSetAttribute (see lupine_func_attr_key comment
+// for the full list); OPT-3 keeps this cache in sync on every successful
+// SET, so the GET cache is always correct without time-based invalidation.
 extern "C" CUresult
 lupine_cuFuncGetAttribute_cached(int *pi, CUfunction_attribute attrib,
                                  CUfunction hfunc) {
   if (pi == nullptr) {
     return CUDA_ERROR_INVALID_VALUE;
   }
-  lupine_function_attribute_key key{reinterpret_cast<uintptr_t>(hfunc),
-                                    static_cast<int>(attrib)};
+  lupine_func_attr_key key{reinterpret_cast<uintptr_t>(hfunc),
+                           static_cast<int>(attrib)};
   {
     std::lock_guard<std::mutex> lock(lupine_function_attribute_cache_mutex());
     auto it = lupine_function_attribute_cache().find(key);
@@ -4246,28 +4306,24 @@ lupine_cuFuncGetAttribute_cached(int *pi, CUfunction_attribute attrib,
   return return_value;
 }
 
-extern "C" CUresult lupine_cuFuncGetAttribute_safe(int *pi,
-                                                   CUfunction_attribute attrib,
-                                                   CUfunction hfunc) {
-  return lupine_cuFuncGetAttribute_cached(pi, attrib, hfunc);
-}
-
 // LUPINE-OPT-3: cached wrapper for cuFuncSetAttribute. Setting (func, attr)
-// to the same value it already holds is a no-op; track last-set value and
-// skip the RPC when unchanged.
+// to the same value it already holds is semantically idempotent — the final
+// driver state is identical regardless of whether the call is forwarded.
+// We track the last-set value and skip the RPC when unchanged.
 //
-// Cross-invalidation note (OPT-2 <-> OPT-3):
-// Most cuFunc attributes are immutable for the CUfunction's lifetime, but two
-// are runtime-mutable via cuFuncSetAttribute:
-//   * CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
-//   * CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT
-// On a successful SET we must also update OPT-2's GET cache for (func, attr),
-// otherwise the next cuFuncGetAttribute will return the stale pre-SET value.
+// Cross-invalidation: OPT-3 keeps OPT-2 in sync on every successful SET
+// (mandatory for the nine runtime-mutable attributes listed in
+// lupine_func_attr_key). It also clears OPT-K2/K3 wholesale because a
+// function SET mutates the same underlying attribute that
+// cuKernelGetAttribute reads when the CUfunction corresponds to the CUkernel
+// on `dev` — we cannot cheaply enumerate that mapping without a reverse map
+// and a current-context lookup, so the conservative clear matches the
+// occupancy-clear strategy below.
 extern "C" CUresult
 lupine_cuFuncSetAttribute_cached(CUfunction hfunc, CUfunction_attribute attrib,
                                  int value) {
-  lupine_function_set_attr_key key{reinterpret_cast<uintptr_t>(hfunc),
-                                   static_cast<int>(attrib)};
+  lupine_func_attr_key key{reinterpret_cast<uintptr_t>(hfunc),
+                           static_cast<int>(attrib)};
   {
     std::lock_guard<std::mutex> lock(lupine_function_set_attr_cache_mutex());
     auto it = lupine_function_set_attr_cache().find(key);
@@ -4307,20 +4363,14 @@ lupine_cuFuncSetAttribute_cached(CUfunction hfunc, CUfunction_attribute attrib,
       std::lock_guard<std::mutex> lock(lupine_function_set_attr_cache_mutex());
       lupine_function_set_attr_cache()[key] = value;
     }
-    // LUPINE-OPT-3 cross-invalidation: also update OPT-2's GET cache for
-    // (func, attr) so subsequent cuFuncGetAttribute calls return the new value
-    // without an RPC. This is mandatory for the nine mutable attributes
-    // (CACHE_MODE_CA, MAX_DYNAMIC_SHARED_SIZE_BYTES,
-    // PREFERRED_SHARED_MEMORY_CARVEOUT, CLUSTER_SIZE_MUST_BE_SET,
-    // REQUIRED_CLUSTER_WIDTH/HEIGHT/DEPTH, NON_PORTABLE_CLUSTER_SIZE_ALLOWED,
-    // CLUSTER_SCHEDULING_POLICY_PREFERENCE) and a pure optimization for the
-    // immutable ones (the SET RPC would have failed for those, so we never
-    // reach this branch).
-    lupine_function_attribute_key get_key{reinterpret_cast<uintptr_t>(hfunc),
-                                          static_cast<int>(attrib)};
-    std::lock_guard<std::mutex> get_lock(
-        lupine_function_attribute_cache_mutex());
-    lupine_function_attribute_cache()[get_key] = value;
+    // Update OPT-2 GET cache so subsequent cuFuncGetAttribute hits.
+    {
+      std::lock_guard<std::mutex> lock(lupine_function_attribute_cache_mutex());
+      lupine_function_attribute_cache()[key] = value;
+    }
+    // Cross-invalidate kernel-side caches (function and kernel refer to
+    // the same kernel object on the server).
+    lupine_clear_kernel_attr_caches();
     // LUPINE-OPT-3 occupancy-cache invalidation: raising
     // MAX_DYNAMIC_SHARED_SIZE_BYTES can change the correct answer for
     // previously-cached cuOccupancyMaxActiveBlocksPerMultiprocessor* queries
@@ -4335,15 +4385,180 @@ lupine_cuFuncSetAttribute_cached(CUfunction hfunc, CUfunction_attribute attrib,
   return result;
 }
 
-// PATCH-D: public LD_PRELOAD-resolved symbols. These functions are marked
-// @disabled client in codegen/annotations.h, so the codegen does NOT emit
-// a generated stub. We provide the public symbol here, delegating to the
-// cached wrappers so raw CUDA clients (linking directly against
-// libcuda.so.1 instead of using cuGetProcAddress_v2) also benefit from
-// OPT-2/OPT-3 and the cross-invalidation / occupancy-cache invalidation
-// fixes. PyTorch / cuBLAS / modern clients resolve via
-// cuGetProcAddress_v2, which also routes through the cached wrappers
-// (see client.cpp::cuGetProcAddress_v2).
+// LUPINE-OPT-K2: cached wrapper for cuKernelGetAttribute. Mirrors
+// lupine_cuFuncGetAttribute_cached but with two differences required by the
+// cuKernel API signature:
+//   1. The cache key includes `dev` because cuKernelGetAttribute is
+//      device-scoped — the same (kernel, attr) can return different values
+//      on different devices for the runtime-mutable attributes.
+//   2. The wrapper resolves the canonical client-side CUkernel to the
+//      route-specific handle via lupine_resolve_library_kernel_for_route
+//      before issuing the RPC. This is the CUkernel analog of
+//      lupine_translate_private_function and is required because different
+//      servers mint distinct CUkernel handles for the same kernel.
+extern "C" CUresult
+lupine_cuKernelGetAttribute_cached(int *pi, CUfunction_attribute attrib,
+                                   CUkernel kernel, CUdevice dev) {
+  if (pi == nullptr) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  lupine_route route = lupine_route_for_device(&dev);
+  if (lupine_route_is_local(route) && lupine_route_identity(route) == -2) {
+    return CUDA_ERROR_DEVICE_UNAVAILABLE;
+  }
+  // Resolve the canonical client-side kernel to the route-specific handle.
+  // If `kernel` is not in lupine_library_kernels() (e.g. a foreign handle
+  // from a local real CUDA call), this is a no-op and `resolved` is set to
+  // the original handle.
+  CUfunction resolved = reinterpret_cast<CUfunction>(kernel);
+  CUresult resolve_status =
+      lupine_resolve_library_kernel_for_route(resolved, route, &resolved);
+  if (resolve_status != CUDA_SUCCESS) {
+    return resolve_status;
+  }
+  lupine_kernel_attr_key key{reinterpret_cast<uintptr_t>(resolved),
+                             static_cast<int>(attrib), static_cast<int>(dev)};
+  {
+    std::lock_guard<std::mutex> lock(lupine_kernel_attribute_cache_mutex());
+    auto it = lupine_kernel_attribute_cache().find(key);
+    if (it != lupine_kernel_attribute_cache().end()) {
+      *pi = it->second;
+      return CUDA_SUCCESS;
+    }
+  }
+  // Cache miss: issue the RPC directly (matches the pattern used by
+  // lupine_cuFuncGetAttribute_cached).
+  CUresult result;
+  int value = 0;
+  if (lupine_route_is_local(route)) {
+    using real_fn_t =
+        CUresult (*)(int *, CUfunction_attribute, CUkernel, CUdevice);
+    auto real = lupine_real_cuda_fn<real_fn_t>("cuKernelGetAttribute");
+    if (real == nullptr) {
+      return CUDA_ERROR_DEVICE_UNAVAILABLE;
+    }
+    result = real(pi, attrib, reinterpret_cast<CUkernel>(resolved), dev);
+    if (result == CUDA_SUCCESS) {
+      value = *pi;
+    }
+  } else {
+    conn_t *conn = lupine_route_remote_conn(route);
+    CUresult return_value;
+    // Server reads pi (placeholder, overwritten with result), attrib, kernel,
+    // dev. We send pi as a placeholder int (matches the wire format upstream
+    // clients produce — see generated handle_cuKernelGetAttribute in
+    // gen_server.cpp).
+    int pi_placeholder = *pi;
+    CUkernel route_kernel = reinterpret_cast<CUkernel>(resolved);
+    if (conn == nullptr ||
+        rpc_write_start_request(conn, RPC_cuKernelGetAttribute) < 0 ||
+        rpc_write(conn, &pi_placeholder, sizeof(int)) < 0 ||
+        rpc_write(conn, &attrib, sizeof(attrib)) < 0 ||
+        rpc_write(conn, &route_kernel, sizeof(route_kernel)) < 0 ||
+        rpc_write(conn, &dev, sizeof(dev)) < 0 ||
+        rpc_wait_for_response(conn) < 0 ||
+        rpc_read(conn, &value, sizeof(value)) < 0 ||
+        rpc_read(conn, &return_value, sizeof(return_value)) < 0 ||
+        rpc_read_end(conn) < 0) {
+      return CUDA_ERROR_DEVICE_UNAVAILABLE;
+    }
+    result = return_value;
+  }
+  if (result == CUDA_SUCCESS) {
+    std::lock_guard<std::mutex> lock(lupine_kernel_attribute_cache_mutex());
+    lupine_kernel_attribute_cache()[key] = value;
+    *pi = value;
+  }
+  return result;
+}
+
+// LUPINE-OPT-K3: cached wrapper for cuKernelSetAttribute. Mirrors
+// lupine_cuFuncSetAttribute_cached with the same two differences as OPT-K2
+// (dev in key, route-resolved kernel handle). Setting (kernel, attr, dev)
+// to the same value is semantically idempotent — skip the RPC when unchanged.
+//
+// Cross-invalidation: OPT-K3 keeps OPT-K2 in sync on every successful SET
+// (mandatory for the nine runtime-mutable attributes). It also clears
+// OPT-2/OPT-3 wholesale because a kernel SET mutates the same underlying
+// attribute that cuFuncGetAttribute reads when the CUfunction corresponds
+// to the CUkernel on `dev` (symmetric to OPT-3's kernel-side clear).
+extern "C" CUresult
+lupine_cuKernelSetAttribute_cached(CUfunction_attribute attrib, int val,
+                                   CUkernel kernel, CUdevice dev) {
+  lupine_route route = lupine_route_for_device(&dev);
+  if (lupine_route_is_local(route) && lupine_route_identity(route) == -2) {
+    return CUDA_ERROR_DEVICE_UNAVAILABLE;
+  }
+  CUfunction resolved = reinterpret_cast<CUfunction>(kernel);
+  CUresult resolve_status =
+      lupine_resolve_library_kernel_for_route(resolved, route, &resolved);
+  if (resolve_status != CUDA_SUCCESS) {
+    return resolve_status;
+  }
+  lupine_kernel_attr_key key{reinterpret_cast<uintptr_t>(resolved),
+                             static_cast<int>(attrib), static_cast<int>(dev)};
+  {
+    std::lock_guard<std::mutex> lock(lupine_kernel_set_attr_cache_mutex());
+    auto it = lupine_kernel_set_attr_cache().find(key);
+    if (it != lupine_kernel_set_attr_cache().end() && it->second == val) {
+      return CUDA_SUCCESS; // no-op, skip RPC
+    }
+  }
+  // Cache miss or value changed: issue the RPC directly.
+  CUresult result;
+  if (lupine_route_is_local(route)) {
+    using real_fn_t =
+        CUresult (*)(CUfunction_attribute, int, CUkernel, CUdevice);
+    auto real = lupine_real_cuda_fn<real_fn_t>("cuKernelSetAttribute");
+    if (real == nullptr) {
+      return CUDA_ERROR_DEVICE_UNAVAILABLE;
+    }
+    result = real(attrib, val, reinterpret_cast<CUkernel>(resolved), dev);
+  } else {
+    conn_t *conn = lupine_route_remote_conn(route);
+    CUkernel route_kernel = reinterpret_cast<CUkernel>(resolved);
+    CUresult return_value;
+    if (conn == nullptr ||
+        rpc_write_start_request(conn, RPC_cuKernelSetAttribute) < 0 ||
+        rpc_write(conn, &attrib, sizeof(attrib)) < 0 ||
+        rpc_write(conn, &val, sizeof(val)) < 0 ||
+        rpc_write(conn, &route_kernel, sizeof(route_kernel)) < 0 ||
+        rpc_write(conn, &dev, sizeof(dev)) < 0 ||
+        rpc_wait_for_response(conn) < 0 ||
+        rpc_read(conn, &return_value, sizeof(return_value)) < 0 ||
+        rpc_read_end(conn) < 0) {
+      return CUDA_ERROR_DEVICE_UNAVAILABLE;
+    }
+    result = return_value;
+  }
+  if (result == CUDA_SUCCESS) {
+    {
+      std::lock_guard<std::mutex> lock(lupine_kernel_set_attr_cache_mutex());
+      lupine_kernel_set_attr_cache()[key] = val;
+    }
+    // Update OPT-K2 GET cache so subsequent cuKernelGetAttribute hits.
+    {
+      std::lock_guard<std::mutex> lock(lupine_kernel_attribute_cache_mutex());
+      lupine_kernel_attribute_cache()[key] = val;
+    }
+    // Cross-invalidate function-side caches (function and kernel refer to
+    // the same kernel object on the server).
+    lupine_clear_function_attr_caches();
+    // Occupancy cache: MAX_DYNAMIC_SHARED_SIZE_BYTES affects occupancy.
+    // Same rationale as lupine_cuFuncSetAttribute_cached above.
+    std::lock_guard<std::mutex> occ_lock(lupine_occupancy_cache_mutex());
+    lupine_occupancy_cache().clear();
+  }
+  return result;
+}
+
+// PATCH-D / PATCH-K-D: public LD_PRELOAD-resolved symbols. These functions
+// are marked @disabled client in codegen/annotations.h, so the codegen does
+// NOT emit a generated stub. We provide the public symbol here, delegating
+// to the cached wrappers so raw CUDA clients (linking directly against
+// libcuda.so.1 instead of using cuGetProcAddress_v2) also benefit from the
+// caches and cross-invalidation. PyTorch / cuBLAS / modern clients resolve
+// via cuGetProcAddress_v2, which also routes through the cached wrappers.
 extern "C" CUresult cuFuncGetAttribute(int *pi, CUfunction_attribute attrib,
                                        CUfunction hfunc) {
   return lupine_cuFuncGetAttribute_cached(pi, attrib, hfunc);
@@ -4351,6 +4566,14 @@ extern "C" CUresult cuFuncGetAttribute(int *pi, CUfunction_attribute attrib,
 extern "C" CUresult cuFuncSetAttribute(CUfunction hfunc,
                                        CUfunction_attribute attrib, int value) {
   return lupine_cuFuncSetAttribute_cached(hfunc, attrib, value);
+}
+extern "C" CUresult cuKernelGetAttribute(int *pi, CUfunction_attribute attrib,
+                                         CUkernel kernel, CUdevice dev) {
+  return lupine_cuKernelGetAttribute_cached(pi, attrib, kernel, dev);
+}
+extern "C" CUresult cuKernelSetAttribute(CUfunction_attribute attrib, int val,
+                                         CUkernel kernel, CUdevice dev) {
+  return lupine_cuKernelSetAttribute_cached(attrib, val, kernel, dev);
 }
 
 extern "C" CUresult lupine_cuOccupancyMaxActiveBlocksPerMultiprocessor_safe(
@@ -7615,7 +7838,7 @@ CUresult cuGetProcAddress_v2(const char *symbol, void **pfn, int cudaVersion,
   (void)flags;
 
   if (strcmp(symbol, "cuFuncGetAttribute") == 0) {
-    *pfn = reinterpret_cast<void *>(&lupine_cuFuncGetAttribute_safe);
+    *pfn = reinterpret_cast<void *>(&lupine_cuFuncGetAttribute_cached);
     if (symbolStatus != nullptr) {
       *symbolStatus = CU_GET_PROC_ADDRESS_SUCCESS;
     }
@@ -7624,6 +7847,22 @@ CUresult cuGetProcAddress_v2(const char *symbol, void **pfn, int cudaVersion,
   // LUPINE-OPT-3: route cuFuncSetAttribute through the cached wrapper.
   if (strcmp(symbol, "cuFuncSetAttribute") == 0) {
     *pfn = reinterpret_cast<void *>(&lupine_cuFuncSetAttribute_cached);
+    if (symbolStatus != nullptr) {
+      *symbolStatus = CU_GET_PROC_ADDRESS_SUCCESS;
+    }
+    return CUDA_SUCCESS;
+  }
+  // LUPINE-OPT-K2: route cuKernelGetAttribute through the cached wrapper.
+  if (strcmp(symbol, "cuKernelGetAttribute") == 0) {
+    *pfn = reinterpret_cast<void *>(&lupine_cuKernelGetAttribute_cached);
+    if (symbolStatus != nullptr) {
+      *symbolStatus = CU_GET_PROC_ADDRESS_SUCCESS;
+    }
+    return CUDA_SUCCESS;
+  }
+  // LUPINE-OPT-K3: route cuKernelSetAttribute through the cached wrapper.
+  if (strcmp(symbol, "cuKernelSetAttribute") == 0) {
+    *pfn = reinterpret_cast<void *>(&lupine_cuKernelSetAttribute_cached);
     if (symbolStatus != nullptr) {
       *symbolStatus = CU_GET_PROC_ADDRESS_SUCCESS;
     }
@@ -7777,7 +8016,16 @@ void *dlsym(void *handle, const char *name) __THROW {
   }
 
   if (strcmp(name, "cuFuncGetAttribute") == 0) {
-    return reinterpret_cast<void *>(&lupine_cuFuncGetAttribute_safe);
+    return reinterpret_cast<void *>(&lupine_cuFuncGetAttribute_cached);
+  }
+  if (strcmp(name, "cuFuncSetAttribute") == 0) {
+    return reinterpret_cast<void *>(&lupine_cuFuncSetAttribute_cached);
+  }
+  if (strcmp(name, "cuKernelGetAttribute") == 0) {
+    return reinterpret_cast<void *>(&lupine_cuKernelGetAttribute_cached);
+  }
+  if (strcmp(name, "cuKernelSetAttribute") == 0) {
+    return reinterpret_cast<void *>(&lupine_cuKernelSetAttribute_cached);
   }
   if (strcmp(name, "cuPointerGetAttributes") == 0) {
     return reinterpret_cast<void *>(&cuPointerGetAttributes);

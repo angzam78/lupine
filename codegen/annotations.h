@@ -2511,6 +2511,7 @@ CUresult cuLibraryGetManaged(CUdeviceptr *dptr, size_t *bytes,
 CUresult cuLibraryGetUnifiedFunction(void **fptr, CUlibrary library,
                                      const char *symbol);
 /**
+ * @disabled client - manual client routes through lupine_cuKernelGetAttribute_cached (OPT-K2)
  * @param pi SEND_RECV
  * @param attrib SEND_ONLY
  * @param kernel SEND_ONLY
@@ -2519,6 +2520,7 @@ CUresult cuLibraryGetUnifiedFunction(void **fptr, CUlibrary library,
 CUresult cuKernelGetAttribute(int *pi, CUfunction_attribute attrib,
                               CUkernel kernel, CUdevice dev);
 /**
+ * @disabled client - manual client routes through lupine_cuKernelSetAttribute_cached (OPT-K3)
  * @param attrib SEND_ONLY
  * @param val SEND_ONLY
  * @param kernel SEND_ONLY
