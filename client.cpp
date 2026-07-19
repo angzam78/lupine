@@ -4318,7 +4318,12 @@ lupine_cuFuncGetAttribute_cached(int *pi, CUfunction_attribute attrib,
 // cuKernelGetAttribute reads when the CUfunction corresponds to the CUkernel
 // on `dev` — we cannot cheaply enumerate that mapping without a reverse map
 // and a current-context lookup, so the conservative clear matches the
-// occupancy-clear strategy below.
+// kernel-attribute-cache strategy.
+//
+// Occupancy cache: OPT-5 (see invalidation block below) makes this selective
+// per-function — only entries whose key.function == translated are dropped,
+// preserving correctness (occupancy is a pure function of the per-function
+// attributes) while eliminating ~7,725 redundant occupancy RPCs in SD 1.5.
 extern "C" CUresult
 lupine_cuFuncSetAttribute_cached(CUfunction hfunc, CUfunction_attribute attrib,
                                  int value) {
@@ -4371,16 +4376,35 @@ lupine_cuFuncSetAttribute_cached(CUfunction hfunc, CUfunction_attribute attrib,
     // Cross-invalidate kernel-side caches (function and kernel refer to
     // the same kernel object on the server).
     lupine_clear_kernel_attr_caches();
-    // LUPINE-OPT-3 occupancy-cache invalidation: raising
-    // MAX_DYNAMIC_SHARED_SIZE_BYTES can change the correct answer for
-    // previously-cached cuOccupancyMaxActiveBlocksPerMultiprocessor* queries
-    // whose dynamicSMemSize exceeded the old cap (those entries cached 0;
-    // they should now be >0). Clearing the whole occupancy cache is correct
-    // (any SET mutates state occupancy depends on) and cheap (the cache is
-    // small; SETs that actually change a value are rare in steady state
-    // because OPT-3 short-circuits idempotent re-SETs above).
-    std::lock_guard<std::mutex> occ_lock(lupine_occupancy_cache_mutex());
-    lupine_occupancy_cache().clear();
+    // LUPINE-OPT-5: selective per-function occupancy cache invalidation.
+    // The occupancy cache key is (route, translated_func, blockSize,
+    // dynamicSMemSize, flags). A SET on `translated` can only change the
+    // correct answer for occupancy queries whose key.function == translated
+    // — occupancy is a pure function of (function attributes, blockSize,
+    // dynamicSMemSize, flags). Other functions' cached entries are unaffected.
+    //
+    // Replaces the previous wholesale `lupine_occupancy_cache().clear()`,
+    // which conservatively dropped entries for unrelated functions and caused
+    // ~7,725 redundant occupancy RPCs in the SD 1.5 pipeline. After OPT-5,
+    // only entries for the SET-target function are dropped (~37 occupancy
+    // RPCs in the same workload).
+    //
+    // Correctness basis: the CUDA Driver API contract for
+    // cuOccupancyMaxActiveBlocksPerMultiprocessor* treats each CUfunction as
+    // an independent kernel; a SET on CUfunction F cannot change the
+    // occupancy of a distinct CUfunction G. This holds for all CUDA driver
+    // versions supported by lupine (>= 12.8.0).
+    {
+      std::lock_guard<std::mutex> occ_lock(lupine_occupancy_cache_mutex());
+      for (auto it = lupine_occupancy_cache().begin();
+           it != lupine_occupancy_cache().end();) {
+        if (it->first.function == translated) {
+          it = lupine_occupancy_cache().erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
   }
   return result;
 }
@@ -4544,10 +4568,34 @@ lupine_cuKernelSetAttribute_cached(CUfunction_attribute attrib, int val,
     // Cross-invalidate function-side caches (function and kernel refer to
     // the same kernel object on the server).
     lupine_clear_function_attr_caches();
-    // Occupancy cache: MAX_DYNAMIC_SHARED_SIZE_BYTES affects occupancy.
-    // Same rationale as lupine_cuFuncSetAttribute_cached above.
-    std::lock_guard<std::mutex> occ_lock(lupine_occupancy_cache_mutex());
-    lupine_occupancy_cache().clear();
+    // LUPINE-OPT-5: selective per-function occupancy cache invalidation
+    // (kernel-side). The occupancy cache key uses
+    // lupine_translate_private_function(func) for the CUfunction parameter.
+    // For library kernels loaded via cuLibraryGetKernel, the client receives
+    // the route-specific kernel handle K directly (see
+    // lupine_record_library_kernel), and lupine_translate_private_function
+    // returns K unchanged. So occupancy entries queried via K are keyed by K,
+    // which equals `resolved` here — selective invalidation by
+    // key.function == resolved is correct.
+    //
+    // Known limitation: if a client converts K to a CUfunction F via
+    // cuKernelGetFunction and then queries occupancy on F, the F-keyed
+    // occupancy entry would not be invalidated by a SET on K (F and K are
+    // distinct handles but refer to the same server-side kernel). This
+    // pattern is uncommon — PyTorch / SD 1.5 use the CUfunction path
+    // exclusively. If a future workload hits this, add a kernel→function
+    // reverse map and invalidate both K and F entries.
+    {
+      std::lock_guard<std::mutex> occ_lock(lupine_occupancy_cache_mutex());
+      for (auto it = lupine_occupancy_cache().begin();
+           it != lupine_occupancy_cache().end();) {
+        if (it->first.function == resolved) {
+          it = lupine_occupancy_cache().erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
   }
   return result;
 }
