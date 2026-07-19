@@ -112,6 +112,7 @@ int rpc_write_lane_termination(conn_t *conn, uint64_t lane_id) {
 #ifdef LUPINE_RPC_CLIENT
 extern void rpc_destroy_thread_lane(uint64_t lane_id);
 extern "C" void lupine_invalidate_current_context_cache();
+extern "C" void lupine_invalidate_function_caches();
 #else
 static void rpc_destroy_thread_lane(uint64_t lane_id) { (void)lane_id; }
 #endif
@@ -120,6 +121,10 @@ static void rpc_mark_connection_closed(conn_t *conn) {
   conn->closed = 1;
 #ifdef LUPINE_RPC_CLIENT
   lupine_invalidate_current_context_cache();
+  // LUPINE-OPT-2/3/K2/K3: server driver state does not survive a reconnect.
+  // Clear the attribute caches so the next GET/SET issues an RPC instead of
+  // returning stale values relative to the new server's driver state.
+  lupine_invalidate_function_caches();
 #endif
 }
 

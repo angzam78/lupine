@@ -2191,6 +2191,7 @@ CUresult cuCtxCreate_v2(CUcontext *pctx, unsigned int flags, CUdevice dev);
 CUresult cuCtxCreate_v3(CUcontext *pctx, CUexecAffinityParam *paramsArray,
                         int numParams, unsigned int flags, CUdevice dev);
 /**
+ * @disabled client - manual client hooks lupine_handle_context_destroyed for OPT-1 edge case
  * @disabled server - manual server coordinates retained staging lifecycle
  * @param ctx SEND_ONLY
  */
@@ -2466,6 +2467,7 @@ CUresult cuLibraryGetModule(CUmodule *pMod, CUlibrary library);
  */
 CUresult cuKernelGetFunction(CUfunction *pFunc, CUkernel kernel);
 /**
+ * @disabled client - manual client routes through lupine_cuKernelGetParamInfo_cached (OPT-4)
  * @routingkey FUNCTION kernel
  * @param kernel SEND_ONLY
  * @param paramIndex SEND_ONLY
@@ -2475,6 +2477,7 @@ CUresult cuKernelGetFunction(CUfunction *pFunc, CUkernel kernel);
 CUresult cuKernelGetParamInfo(CUkernel kernel, size_t paramIndex,
                               size_t *paramOffset, size_t *paramSize);
 /**
+ * @disabled client - manual client routes through lupine_cuFuncGetParamInfo_cached (OPT-4)
  * @routingkey FUNCTION func
  * @param func SEND_ONLY
  * @param paramIndex SEND_ONLY
@@ -2510,6 +2513,7 @@ CUresult cuLibraryGetManaged(CUdeviceptr *dptr, size_t *bytes,
 CUresult cuLibraryGetUnifiedFunction(void **fptr, CUlibrary library,
                                      const char *symbol);
 /**
+ * @disabled client - manual client routes through lupine_cuKernelGetAttribute_cached (OPT-K2)
  * @param pi SEND_RECV
  * @param attrib SEND_ONLY
  * @param kernel SEND_ONLY
@@ -2518,6 +2522,7 @@ CUresult cuLibraryGetUnifiedFunction(void **fptr, CUlibrary library,
 CUresult cuKernelGetAttribute(int *pi, CUfunction_attribute attrib,
                               CUkernel kernel, CUdevice dev);
 /**
+ * @disabled client - manual client routes through lupine_cuKernelSetAttribute_cached (OPT-K3)
  * @param attrib SEND_ONLY
  * @param val SEND_ONLY
  * @param kernel SEND_ONLY
@@ -3638,6 +3643,7 @@ CUresult cuStreamBatchMemOp_v2(CUstream stream, unsigned int count,
                                CUstreamBatchMemOpParams *paramArray,
                                unsigned int flags);
 /**
+ * @disabled client - manual client routes through lupine_cuFuncGetAttribute_cached (OPT-2)
  * @routingkey FUNCTION hfunc
  * @param pi SEND_RECV
  * @param attrib SEND_ONLY
@@ -3646,6 +3652,7 @@ CUresult cuStreamBatchMemOp_v2(CUstream stream, unsigned int count,
 CUresult cuFuncGetAttribute(int *pi, CUfunction_attribute attrib,
                             CUfunction hfunc);
 /**
+ * @disabled client - manual client routes through lupine_cuFuncSetAttribute_cached (OPT-3)
  * @routingkey FUNCTION hfunc
  * @param hfunc SEND_ONLY
  * @param attrib SEND_ONLY
