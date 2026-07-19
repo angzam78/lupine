@@ -4575,6 +4575,27 @@ extern "C" CUresult cuKernelSetAttribute(CUfunction_attribute attrib, int val,
                                          CUkernel kernel, CUdevice dev) {
   return lupine_cuKernelSetAttribute_cached(attrib, val, kernel, dev);
 }
+// OPT-4: public LD_PRELOAD-resolved symbols. Annotations.h marks both
+// functions @disabled client so the codegen does NOT emit generated stubs.
+// We provide the public symbol here, delegating to the cached wrappers so
+// raw CUDA clients (linking directly against libcuda.so.1 instead of using
+// cuGetProcAddress_v2) also benefit from the cache. Without this override,
+// PyTorch's direct symbol link to cuFuncGetParamInfo / cuKernelGetParamInfo
+// would resolve to nothing (the @disabled annotation suppresses the stub)
+// OR to an uncached RPC path -- either way, ~2.5K RPCs per SD 1.5 run
+// that the cache should eliminate.
+extern "C" CUresult cuFuncGetParamInfo(CUfunction func, size_t paramIndex,
+                                       size_t *paramOffset,
+                                       size_t *paramSize) {
+  return lupine_cuFuncGetParamInfo_cached(func, paramIndex, paramOffset,
+                                          paramSize);
+}
+extern "C" CUresult cuKernelGetParamInfo(CUkernel kernel, size_t paramIndex,
+                                         size_t *paramOffset,
+                                         size_t *paramSize) {
+  return lupine_cuKernelGetParamInfo_cached(kernel, paramIndex, paramOffset,
+                                            paramSize);
+}
 
 extern "C" CUresult lupine_cuOccupancyMaxActiveBlocksPerMultiprocessor_safe(
     int *numBlocks, CUfunction func, int blockSize, size_t dynamicSMemSize) {

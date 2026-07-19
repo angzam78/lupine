@@ -2467,6 +2467,7 @@ CUresult cuLibraryGetModule(CUmodule *pMod, CUlibrary library);
  */
 CUresult cuKernelGetFunction(CUfunction *pFunc, CUkernel kernel);
 /**
+ * @disabled client - manual client routes through lupine_cuKernelGetParamInfo_cached (OPT-4)
  * @routingkey FUNCTION kernel
  * @param kernel SEND_ONLY
  * @param paramIndex SEND_ONLY
@@ -2476,6 +2477,7 @@ CUresult cuKernelGetFunction(CUfunction *pFunc, CUkernel kernel);
 CUresult cuKernelGetParamInfo(CUkernel kernel, size_t paramIndex,
                               size_t *paramOffset, size_t *paramSize);
 /**
+ * @disabled client - manual client routes through lupine_cuFuncGetParamInfo_cached (OPT-4)
  * @routingkey FUNCTION func
  * @param func SEND_ONLY
  * @param paramIndex SEND_ONLY
