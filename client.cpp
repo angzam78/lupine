@@ -7868,6 +7868,23 @@ CUresult cuGetProcAddress_v2(const char *symbol, void **pfn, int cudaVersion,
     }
     return CUDA_SUCCESS;
   }
+  // LUPINE-OPT-4: route cuFuncGetParamInfo / cuKernelGetParamInfo through the
+  // cached wrappers. Result is a pure function of (handle, paramIndex) for an
+  // immutable kernel/function, so the RPC can be skipped on repeat lookups.
+  if (strcmp(symbol, "cuFuncGetParamInfo") == 0) {
+    *pfn = reinterpret_cast<void *>(&lupine_cuFuncGetParamInfo_cached);
+    if (symbolStatus != nullptr) {
+      *symbolStatus = CU_GET_PROC_ADDRESS_SUCCESS;
+    }
+    return CUDA_SUCCESS;
+  }
+  if (strcmp(symbol, "cuKernelGetParamInfo") == 0) {
+    *pfn = reinterpret_cast<void *>(&lupine_cuKernelGetParamInfo_cached);
+    if (symbolStatus != nullptr) {
+      *symbolStatus = CU_GET_PROC_ADDRESS_SUCCESS;
+    }
+    return CUDA_SUCCESS;
+  }
   if (strcmp(symbol, "cuPointerGetAttributes") == 0) {
     *pfn = reinterpret_cast<void *>(&cuPointerGetAttributes);
     if (symbolStatus != nullptr) {
@@ -8026,6 +8043,13 @@ void *dlsym(void *handle, const char *name) __THROW {
   }
   if (strcmp(name, "cuKernelSetAttribute") == 0) {
     return reinterpret_cast<void *>(&lupine_cuKernelSetAttribute_cached);
+  }
+  // LUPINE-OPT-4: dlsym-side hook for the param-info cached wrappers.
+  if (strcmp(name, "cuFuncGetParamInfo") == 0) {
+    return reinterpret_cast<void *>(&lupine_cuFuncGetParamInfo_cached);
+  }
+  if (strcmp(name, "cuKernelGetParamInfo") == 0) {
+    return reinterpret_cast<void *>(&lupine_cuKernelGetParamInfo_cached);
   }
   if (strcmp(name, "cuPointerGetAttributes") == 0) {
     return reinterpret_cast<void *>(&cuPointerGetAttributes);
